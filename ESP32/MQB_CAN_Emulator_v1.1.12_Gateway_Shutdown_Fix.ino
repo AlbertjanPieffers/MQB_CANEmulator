@@ -7,7 +7,7 @@
 #include <ArduinoOTA.h>
 
 /*
- * MQB CAN Emulator v1.0.1
+ * MQB CAN Emulator v1.1.12
  * ESP32-S3 + external CAN transceiver (e.g. SN65HVD230)
  *
  * This is a single-bus MQB Infotainment CAN emulator.
@@ -79,6 +79,17 @@ bool otaReady = false;
 
 String networkMode = "OFF";
 IPAddress networkIp;
+
+// Master switch for the bench gateway replacement.
+// Default ON so the MIB can wake and see the captured vehicle-state traffic
+// immediately after power-up.
+bool simulateGatewayEnabled = true;
+
+// State restored when gateway simulation is switched back on.
+// Stored dimming values remain untouched; only enable/night state is forced
+// OFF while the simulated vehicle network is shut down.
+bool gatewaySavedLightingEnabled = true;
+bool gatewaySavedNightDesign = false;
 
 
 // ============================================================
@@ -378,11 +389,24 @@ bool vehicleStatusProbeActive = false;
 unsigned long vehicleStatusProbeUntil = 0;
 const unsigned long VEHICLE_STATUS_PROBE_MS = 3000UL;
 
-// Minimal experimental LSG 0x0F Bordcomputer provider probe.
-bool bcProviderEnabled = false;
+// Minimal experimental BC_MFA provider on BAP logical channel 0x27.
+// Enabled by default because the MIB discovers this provider during boot.
+bool bcProviderEnabled = true;
+
+// BC_MFA 0x27 provider management timing.
+// The real provider emits management frames cyclically, not only as replies.
+unsigned long bcLastConfigMs = 0;
+unsigned long bcLastFunctionListMs = 0;
+unsigned long bcLastHeartbeatMs = 0;
+bool bcStartupSequencePending = true;
+
+static const unsigned long BC_CONFIG_INTERVAL_MS = 8000UL;
+static const unsigned long BC_FUNCTION_LIST_INTERVAL_MS = 16000UL;
+static const unsigned long BC_HEARTBEAT_INTERVAL_MS = 8000UL;
 
 // Bordcomputer / trip-data laboratory.
-// Function 0x39 is a strong capture-derived candidate for trip distance.
+// Provider channel: request 0x17332700, response 0x17332710.
+// Trip-function semantics are still under reverse engineering.
 bool bcTripTestEnabled = false;
 float bcTripDistanceKm = 123.40f;
 unsigned long bcTripLastSend = 0;
@@ -391,6 +415,43 @@ static const unsigned long BC_TRIP_INTERVAL_MS = 1000UL;
 // Suppress repeated identical ACK lines.
 bool volumeAckKnown = false;
 byte lastVolumeAck = 0;
+
+
+// ============================================================
+// VCDS / UDS COMPONENT IDENTITY SPOOF - BENCH SUPPORT
+// ============================================================
+//
+// Captured 5F diagnostic pair:
+//   Tester -> 5F : 0x773
+//   5F -> Tester : 0x7DD
+//
+// VCDS reads the component text with:
+//   22 F1 97
+//
+// The real MIB returns:
+//   "MU-S-N-ER    "
+//
+// This bench implementation can answer with:
+//   "MQB-PQ-BRIDGE"
+//
+// IMPORTANT:
+// This firmware currently has only one CAN interface. Therefore it cannot
+// suppress the real MIB response when the MIB is connected to the same bus.
+// Keep this feature OFF when benching with the real MIB on the same bus.
+//
+// In the future dual-CAN bridge version this same handler should be used on
+// the PQ-facing side while DID F197 from the MIB-facing side is filtered.
+//
+
+static constexpr unsigned long VCDS_5F_REQUEST_ID  = 0x773UL;
+static constexpr unsigned long VCDS_5F_RESPONSE_ID = 0x7DDUL;
+
+bool diagIdentitySpoofEnabled = false;
+bool diagF197AwaitingFlowControl = false;
+
+// F197 contains 13 ASCII characters in this test response.
+static const char DIAG_COMPONENT_NAME[14] = "MQB-PQ-BRIDGE";
+
 
 void decodeInfotainmentFeedback(
     unsigned long id,
@@ -403,6 +464,14 @@ void decodeVolumeFeedback(byte dlc, const byte *data);
 void decodeAsciiTransport(unsigned long id, byte dlc, const byte *data);
 void printAsciiPayload(const byte *data, byte startIndex, byte dlc);
 
+// Capture-derived Phone (0x28) and Navigation (0x32) BAP decoder.
+void decodePhoneNaviBap(unsigned long id, byte dlc, const byte *data);
+void handlePhoneBap(unsigned long id, byte dlc, const byte *data);
+void handleNaviBap(unsigned long id, byte dlc, const byte *data);
+
+// Capture-derived FM/RDS radio decoder on BAP channel 0x31.
+void decodeRadioBap(unsigned long id, byte dlc, const byte *data);
+
 void decodeMediaMetadata(unsigned long id, byte dlc, const byte *data);
 void resetMediaMetadata();
 void appendMediaBytes(const byte *data, byte startIndex, byte dlc);
@@ -413,12 +482,49 @@ const __FlashStringHelper *mfswButtonName(byte code);
 void armVehicleStatusProbe(const __FlashStringHelper *reason);
 void decodeVehicleStatusProbe(unsigned long id, byte dlc, const byte *data);
 void processBcProvider(unsigned long id, bool extended, byte dlc, const byte *data);
+void updateBcProviderManagement();
 void printCompactExtFrame(
     const __FlashStringHelper *prefix,
     unsigned long id,
     byte dlc,
     const byte *data
 );
+
+
+// ============================================================
+// PHONE / NAVIGATION BAP DECODER STATE
+// ============================================================
+
+struct BapLongMessageCapture
+{
+    bool active;
+    unsigned long canId;
+    byte functionClass;
+    byte functionId;
+
+    // BAP transport family derived from the segmented start frame:
+    //   0x80/0x8x start -> 0xC0/0xCx continuation frames
+    //   0x90/0x9x start -> 0xD0/0xDx continuation frames
+    //
+    // This matters because captures can contain Cx control/other frames while
+    // a 0x9x/Dx transfer is in progress. Mixing both corrupts text payloads.
+    byte continuationFamily;
+
+    byte buffer[96];
+    byte length;
+    unsigned long lastFrameMs;
+};
+
+BapLongMessageCapture phoneLongMessage = {};
+BapLongMessageCapture naviLongMessage = {};
+BapLongMessageCapture radioLongMessage = {};
+
+byte lastPhoneCallState = 0xFF;
+byte lastPhoneActiveFlag = 0xFF;
+byte lastNaviRouteActive = 0xFF;
+byte lastRadioPresetIndex = 0xFF;
+
+static const unsigned long BAP_LONG_MESSAGE_TIMEOUT_MS = 300UL;
 
 
 // ============================================================
@@ -489,7 +595,16 @@ void updateKombi02(CanMessage &message);
 
 void sendMessages();
 bool sendCanMessage(CanMessage &message);
-bool sendRawCan(unsigned long id, bool extended, byte dlc, byte *data);
+bool sendRawCan(unsigned long id, bool extended, byte dlc, const byte *data);
+
+void processDiagnosticSpoof(
+    unsigned long id,
+    bool extended,
+    byte dlc,
+    const byte *data
+);
+void sendDiagF197FirstFrame();
+void sendDiagF197ConsecutiveFrames();
 
 void updateClock();
 void incrementClockOneSecond();
@@ -509,6 +624,96 @@ void sendMfswIdle();
 
 CanMessage messages[] =
 {
+    // Captured Gateway Network Management / node-presence frame.
+    // Bench use only with the physical MQB gateway disconnected.
+    // Together with Klemmen_Status_01 below this is the first gateway-wake test.
+    {
+        "Gateway_NM",
+        0x1B000010UL,
+        true,
+        8,
+        200,
+        0,
+        true,
+        {0x10, 0x00, 0x04, 0x02, 0x19, 0x00, 0x00, 0x00},
+        NULL
+    },
+
+    // Capture-exact vehicle-state frames present with the real gateway/vehicle
+    // network and absent during the first ESP32-only test.
+    // Kept static in v1.1.5 so this test isolates the missing wake/status layer.
+    {
+        "GatewayCapture_3DA",
+        0x3DA,
+        false,
+        8,
+        100,
+        0,
+        true,
+        {0x3F, 0x18, 0x00, 0xFE, 0xFF, 0xF1, 0xFF, 0x00},
+        NULL
+    },
+
+    {
+        "GatewayCapture_3DB",
+        0x3DB,
+        false,
+        8,
+        100,
+        0,
+        true,
+        {0xFE, 0x03, 0x00, 0x00, 0x80, 0x00, 0x00, 0xFE},
+        NULL
+    },
+
+    {
+        "GatewayCapture_3DC",
+        0x3DC,
+        false,
+        8,
+        50,
+        0,
+        true,
+        {0xFF, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00},
+        NULL
+    },
+
+    {
+        "GatewayCapture_3EA",
+        0x3EA,
+        false,
+        8,
+        200,
+        0,
+        true,
+        {0x0F, 0x00, 0x00, 0x40, 0x86, 0xFF, 0x00, 0x00},
+        NULL
+    },
+
+    {
+        "GatewayCapture_585",
+        0x585,
+        false,
+        8,
+        1000,
+        0,
+        true,
+        {0x02, 0x3C, 0xA0, 0x7F, 0x13, 0x00, 0x00, 0x00},
+        NULL
+    },
+
+    {
+        "GatewayCapture_663",
+        0x663,
+        false,
+        8,
+        100,
+        0,
+        true,
+        {0x70, 0x28, 0x01, 0x0E, 0x5F, 0x87, 0x00, 0x04},
+        NULL
+    },
+
     {
         "Klemmen_Status_01",
         0x3C0,
@@ -631,6 +836,10 @@ void setBitsIntel(byte *data, byte startBit, byte length, uint32_t value);
 void setIgnitionOn();
 void setIgnitionOff();
 
+void setGatewaySimulation(bool enabled);
+bool isGatewaySimulationMessage(const CanMessage &message);
+void sendGatewayShutdownBurst();
+
 void monitorCan();
 
 bool shouldPrintRxFrame(unsigned long id, bool extended);
@@ -657,6 +866,7 @@ void sendBcConfig();
 void sendBcFunctionList();
 void sendBcHeartbeatConfig();
 void sendBcTripDistance();
+void updateBcProviderManagement();
 void updateBcTripData();
 
 // ============================================================
@@ -823,6 +1033,8 @@ a{color:#93c5fd}
 <div class="row"><span>RX</span><b id="rx">-</b></div>
 <div class="row"><span>TX</span><b id="tx">-</b></div>
 <div class="row"><span>TX errors</span><b id="txe">-</b></div>
+<button onclick="cmd('simulategateway on')">Simulate Gateway ON</button>
+<button onclick="cmd('simulategateway off')">Simulate Gateway OFF</button>
 </div>
 
 <div class="card">
@@ -848,19 +1060,28 @@ a{color:#93c5fd}
 <button onclick="cmd('reverse off')">Reverse OFF</button>
 <button onclick="cmd('handbrake on')">Handbrake ON</button>
 <button onclick="cmd('handbrake off')">Handbrake OFF</button>
-<button onclick="cmd('bcprov on')">BC provider ON</button>
-<button onclick="cmd('bcprov off')">BC provider OFF</button>
+<button onclick="cmd('bcprov on')">BC_MFA 0x27 ON</button>
+<button onclick="cmd('bcprov off')">BC_MFA 0x27 OFF</button>
 </div>
 
 <div class="card">
 <h3>Trip data lab</h3>
-<div class="row"><span>Candidate</span><b>BC Function 0x39</b></div>
-<div class="row"><span>Hypothesis</span><b>Trip distance</b></div>
+<div class="row"><span>Provider</span><b>BC_MFA 0x27</b></div>
+<div class="row"><span>Trip mapping</span><b>Not confirmed yet</b></div>
 <input id="tripkm" type="number" step="0.01" value="123.40" style="width:45%">
 <button onclick="sendTrip()">Send km</button>
 <button onclick="cmd('bctrip on')">Periodic ON</button>
 <button onclick="cmd('bctrip off')">Periodic OFF</button>
-<p><small>Capture-derived test: Status 43 F9 + uint24 LE at 0.01 km + 01.</small></p>
+<p><small>Trip-data TX is intentionally disabled until the 0x27 function mapping is confirmed.</small></p>
+</div>
+
+<div class="card">
+<h3>VCDS identity</h3>
+<div class="row"><span>DID</span><b>F197</b></div>
+<div class="row"><span>Component</span><b>MQB-PQ-BRIDGE</b></div>
+<button onclick="cmd('diagspoof on')">Spoof ON</button>
+<button onclick="cmd('diagspoof off')">Spoof OFF</button>
+<p><small>Single-CAN bench test only. Do not enable while the real MIB is also replying on the same bus.</small></p>
 </div>
 
 <div class="card">
@@ -1126,6 +1347,168 @@ void initOta()
 
 
 // ============================================================
+// GATEWAY SIMULATION MASTER SWITCH
+// ============================================================
+
+bool isGatewaySimulationMessage(const CanMessage &message)
+{
+    if (message.extended && message.id == 0x1B000010UL)
+    {
+        return true;
+    }
+
+    if (!message.extended)
+    {
+        switch (message.id)
+        {
+            case 0x3DA:
+            case 0x3DB:
+            case 0x3DC:
+            case 0x3EA:
+            case 0x585:
+            case 0x663:
+                return true;
+        }
+    }
+
+    return false;
+}
+
+void sendGatewayShutdownBurst()
+{
+    // Tell the MIB explicitly that the vehicle terminals and illumination
+    // disappeared before the emulator becomes completely silent.
+    //
+    // Send a few copies so the state survives normal CAN timing/jitter.
+    for (byte repeat = 0; repeat < 3; repeat++)
+    {
+        byte terminalOff[4] =
+        {
+            klemmenChecksum[klemmenCounter],
+            (byte)(klemmenCounter & 0x0F),
+            0x00,   // Terminal S/15/X/50 all OFF
+            0x00
+        };
+
+        klemmenCounter = (klemmenCounter + 1) & 0x0F;
+
+        const byte dimmingOff[8] =
+        {
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00
+        };
+
+        // Engine / Terminal 75 state to zero as an additional clean shutdown.
+        const byte motor14Off[8] =
+        {
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00
+        };
+
+        sendRawCan(0x3C0, false, 4, terminalOff);
+        sendRawCan(0x5F0, false, 8, dimmingOff);
+        sendRawCan(0x3BE, false, 8, motor14Off);
+
+        delay(20);
+    }
+}
+
+void setGatewaySimulation(bool enabled)
+{
+    if (enabled == simulateGatewayEnabled)
+    {
+        // Keep the command idempotent, but still report the current state.
+        Serial.println();
+        Serial.print(F("SIMULATE GATEWAY already "));
+        Serial.println(enabled ? F("ON") : F("OFF"));
+        Serial.println();
+        return;
+    }
+
+    if (!enabled)
+    {
+        // Preserve the operator's lighting preference so it can be restored
+        // when the simulated gateway is enabled again.
+        gatewaySavedLightingEnabled = lighting.lightsEnabled;
+        gatewaySavedNightDesign = lighting.nightDesign;
+
+        // First update the internal vehicle state.
+        setIgnitionOff();
+
+        // The MIB button/display illumination must disappear with the vehicle.
+        // Stored dimming values are intentionally left intact for restoration.
+        lighting.lightsEnabled = false;
+        lighting.nightDesign = false;
+
+        // Send the final OFF state while CAN TX is still allowed.
+        sendGatewayShutdownBurst();
+
+        // From this point on the emulator becomes silent until re-enabled.
+        simulateGatewayEnabled = false;
+        bcProviderEnabled = false;
+        bcStartupSequencePending = false;
+
+        // Cancel an in-progress steering-wheel event so it cannot restart TX
+        // when the gateway simulation is enabled later.
+        mfsw.active = false;
+        mfsw.releasePending = false;
+
+        Serial.println();
+        Serial.println(F("======================================"));
+        Serial.println(F("SIMULATE GATEWAY: OFF"));
+        Serial.println(F("======================================"));
+        Serial.println(F("Terminal state : OFF burst sent on 0x3C0"));
+        Serial.println(F("Illumination   : OFF burst sent on 0x5F0"));
+        Serial.println(F("Periodic CAN TX: STOPPED (bus-silent emulator)"));
+        Serial.println(F("MFSW idle TX   : STOPPED"));
+        Serial.println(F("BC_MFA 0x27    : OFF"));
+        Serial.println();
+        return;
+    }
+
+    // Re-enable complete simulated vehicle/gateway environment.
+    simulateGatewayEnabled = true;
+    bcProviderEnabled = true;
+
+    bcStartupSequencePending = true;
+    bcLastConfigMs = 0;
+    bcLastFunctionListMs = 0;
+    bcLastHeartbeatMs = 0;
+
+    setIgnitionOn();
+
+    lighting.lightsEnabled = gatewaySavedLightingEnabled;
+    lighting.nightDesign = gatewaySavedNightDesign;
+
+    // Restart all message timers cleanly so we do not get a giant catch-up
+    // burst caused by timestamps that aged while simulation was disabled.
+    unsigned long now = millis();
+
+    for (byte i = 0; i < MESSAGE_COUNT; i++)
+    {
+        messages[i].lastSend = now + ((unsigned long)i * 3UL);
+    }
+
+    lastMotor04 = now + 7UL;
+    lastMotor07 = now + 17UL;
+    lastMotor20 = now + 27UL;
+    lastMotor26 = now + 37UL;
+    mfswLastSend = now;
+
+    Serial.println();
+    Serial.println(F("======================================"));
+    Serial.println(F("SIMULATE GATEWAY: ON"));
+    Serial.println(F("======================================"));
+    Serial.println(F("Gateway NM     : 0x1B000010 @ 200 ms"));
+    Serial.println(F("Ignition       : Terminal S + 15 ON via 0x3C0"));
+    Serial.println(F("Vehicle traffic: periodic TX resumed"));
+    Serial.println(F("Lighting       : previous state restored"));
+    Serial.println(F("BC_MFA 0x27    : ON (Config + FunctionList + Heartbeat)"));
+    Serial.println();
+}
+
+
+// ============================================================
 // SETUP
 // ============================================================
 
@@ -1136,7 +1519,7 @@ void setup()
 
     Serial.println();
     Serial.println(F("======================================"));
-    Serial.println(F("MQB CAN Emulator v1.0.1"));
+    Serial.println(F("MQB CAN Emulator v1.1.12"));
     Serial.println(F("ESP32-S3 / internal TWAI"));
     Serial.println(F("======================================"));
     Serial.println();
@@ -1145,6 +1528,14 @@ void setup()
     initNetwork();
     initWebUi();
     initOta();
+
+    // Default bench behavior: emulate the gateway/vehicle-network presence
+    // immediately after boot. This is intentionally ON by default.
+    //
+    // IMPORTANT: use this only with the physical MQB gateway disconnected.
+    // Force a real OFF->ON transition so all startup timers/state are initialized.
+    simulateGatewayEnabled = false;
+    setGatewaySimulation(true);
 
     unsigned long now = millis();
 
@@ -1178,11 +1569,19 @@ void setup()
 void loop()
 {
     updateClock();
-    updateMfsw();
 
-    sendMessages();
-    sendExtendedVehicleMessages();
-    updateBcTripData();
+    // Gateway OFF means the emulator must be electrically quiet on the CAN
+    // bus after the explicit shutdown burst. Previously several periodic
+    // sources (notably MFSW idle 0x5BF, Dimmung_01 and extended motor frames)
+    // continued transmitting and could partially wake the MIB again.
+    if (simulateGatewayEnabled)
+    {
+        updateMfsw();
+        sendMessages();
+        sendExtendedVehicleMessages();
+        updateBcProviderManagement();
+        updateBcTripData();
+    }
 
     monitorCan();
     processSerial();
@@ -1267,7 +1666,7 @@ bool sendCanMessage(CanMessage &message)
     return sendRawCan(message.id, message.extended, message.dlc, message.data);
 }
 
-bool sendRawCan(unsigned long id, bool extended, byte dlc, byte *data)
+bool sendRawCan(unsigned long id, bool extended, byte dlc, const byte *data)
 {
     if (!canReady || dlc > 8)
     {
@@ -1304,6 +1703,116 @@ bool sendRawCan(unsigned long id, bool extended, byte dlc, byte *data)
     }
 
     return true;
+}
+
+
+// ============================================================
+// VCDS / UDS DID F197 COMPONENT IDENTITY SPOOF
+// ============================================================
+
+void processDiagnosticSpoof(
+    unsigned long id,
+    bool extended,
+    byte dlc,
+    const byte *data
+)
+{
+    if (!diagIdentitySpoofEnabled ||
+        extended ||
+        id != VCDS_5F_REQUEST_ID ||
+        dlc == 0)
+    {
+        return;
+    }
+
+    // ISO-TP single-frame UDS request:
+    //   03 22 F1 97
+    if (dlc >= 4 &&
+        data[0] == 0x03 &&
+        data[1] == 0x22 &&
+        data[2] == 0xF1 &&
+        data[3] == 0x97)
+    {
+        sendDiagF197FirstFrame();
+        diagF197AwaitingFlowControl = true;
+
+        Serial.println(F("[DIAG] VCDS requested DID F197"));
+        Serial.println(F("[DIAG] Sending component identity: MQB-PQ-BRIDGE"));
+        return;
+    }
+
+    // ISO-TP flow control from tester:
+    //   30 BS STmin ...
+    if (diagF197AwaitingFlowControl &&
+        dlc >= 3 &&
+        (data[0] & 0xF0) == 0x30)
+    {
+        const byte flowStatus = data[0] & 0x0F;
+
+        if (flowStatus == 0x00)
+        {
+            sendDiagF197ConsecutiveFrames();
+        }
+        else
+        {
+            Serial.print(F("[DIAG] F197 flow control status = 0x"));
+            Serial.println(flowStatus, HEX);
+        }
+
+        diagF197AwaitingFlowControl = false;
+    }
+}
+
+void sendDiagF197FirstFrame()
+{
+    // UDS payload:
+    //   62 F1 97 + 13 ASCII bytes = 16 bytes total.
+    //
+    // ISO-TP first frame:
+    //   10 10 | 62 F1 97 | "MQB"
+    const byte frame[8] =
+    {
+        0x10, 0x10,
+        0x62, 0xF1, 0x97,
+        (byte)DIAG_COMPONENT_NAME[0],
+        (byte)DIAG_COMPONENT_NAME[1],
+        (byte)DIAG_COMPONENT_NAME[2]
+    };
+
+    sendRawCan(VCDS_5F_RESPONSE_ID, false, 8, frame);
+}
+
+void sendDiagF197ConsecutiveFrames()
+{
+    // Remaining 10 characters after "MQB":
+    //   "-PQ-BRIDGE"
+    const byte frame21[8] =
+    {
+        0x21,
+        (byte)DIAG_COMPONENT_NAME[3],
+        (byte)DIAG_COMPONENT_NAME[4],
+        (byte)DIAG_COMPONENT_NAME[5],
+        (byte)DIAG_COMPONENT_NAME[6],
+        (byte)DIAG_COMPONENT_NAME[7],
+        (byte)DIAG_COMPONENT_NAME[8],
+        (byte)DIAG_COMPONENT_NAME[9]
+    };
+
+    const byte frame22[8] =
+    {
+        0x22,
+        (byte)DIAG_COMPONENT_NAME[10],
+        (byte)DIAG_COMPONENT_NAME[11],
+        (byte)DIAG_COMPONENT_NAME[12],
+        0xAA, 0xAA, 0xAA, 0xAA
+    };
+
+    sendRawCan(VCDS_5F_RESPONSE_ID, false, 8, frame21);
+
+    // The capture used STmin = 1 ms.
+    delay(1);
+
+    sendRawCan(VCDS_5F_RESPONSE_ID, false, 8, frame22);
 }
 
 
@@ -1933,6 +2442,7 @@ void monitorCan()
             buffer[i] = rx.data[i];
         }
 
+        processDiagnosticSpoof(id, extended, len, buffer);
         decodeInfotainmentFeedback(id, extended, len, buffer);
         processBcProvider(id, extended, len, buffer);
 
@@ -1959,6 +2469,14 @@ void decodeInfotainmentFeedback(
     {
         decodeVolumeFeedback(dlc, data);
     }
+
+    // Phone and navigation decoding is kept independent of the generic ASCII
+    // decoder because these captures use BAP segmented 0x8x/0x9x + 0xCx/0xDx
+    // transport, not only the older B0/F0 text pattern.
+    decodePhoneNaviBap(id, dlc, data);
+
+    // FM/RDS station information observed on 0x17333110/11.
+    decodeRadioBap(id, dlc, data);
 
     if (asciiDecoderEnabled)
     {
@@ -2028,6 +2546,416 @@ void decodeVolumeFeedback(byte dlc, const byte *data)
         }
     }
 }
+
+static void resetBapLongMessage(BapLongMessageCapture &msg)
+{
+    msg.active = false;
+    msg.canId = 0;
+    msg.functionClass = 0;
+    msg.functionId = 0;
+    msg.continuationFamily = 0;
+    msg.length = 0;
+    msg.lastFrameMs = 0;
+}
+
+static void appendBapLongBytes(
+    BapLongMessageCapture &msg,
+    const byte *data,
+    byte startIndex,
+    byte dlc
+)
+{
+    for (byte i = startIndex; i < dlc; i++)
+    {
+        if (msg.length >= sizeof(msg.buffer))
+        {
+            break;
+        }
+
+        msg.buffer[msg.length++] = data[i];
+    }
+
+    msg.lastFrameMs = millis();
+}
+
+static void printPrintableRuns(
+    const __FlashStringHelper *prefix,
+    const byte *buffer,
+    byte length
+)
+{
+    bool printedHeader = false;
+    byte runStart = 0;
+    byte runLength = 0;
+
+    for (byte i = 0; i <= length; i++)
+    {
+        bool printable =
+            i < length &&
+            buffer[i] >= 0x20 &&
+            buffer[i] <= 0x7E;
+
+        if (printable)
+        {
+            if (runLength == 0)
+            {
+                runStart = i;
+            }
+
+            runLength++;
+            continue;
+        }
+
+        if (runLength >= 3)
+        {
+            if (!printedHeader)
+            {
+                Serial.print(prefix);
+                printedHeader = true;
+            }
+            else
+            {
+                Serial.print(F(" | "));
+            }
+
+            Serial.print('"');
+
+            for (byte j = 0; j < runLength; j++)
+            {
+                Serial.write(buffer[runStart + j]);
+            }
+
+            Serial.print('"');
+        }
+
+        runLength = 0;
+    }
+
+    if (printedHeader)
+    {
+        Serial.println();
+    }
+}
+
+static void finishPhoneLongMessage()
+{
+    if (!phoneLongMessage.active)
+    {
+        return;
+    }
+
+    if (phoneLongMessage.functionClass == 0x4A &&
+        phoneLongMessage.functionId == 0x17)
+    {
+        Serial.println(F("[PHONE] Caller/contact data received"));
+        printPrintableRuns(
+            F("[PHONE] Text: "),
+            phoneLongMessage.buffer,
+            phoneLongMessage.length
+        );
+    }
+
+    resetBapLongMessage(phoneLongMessage);
+}
+
+static void finishNaviLongMessage()
+{
+    if (!naviLongMessage.active)
+    {
+        return;
+    }
+
+    if (naviLongMessage.functionClass == 0x4C &&
+        naviLongMessage.functionId == 0xAE)
+    {
+        Serial.println(F("[NAVI] Destination/address data received"));
+        printPrintableRuns(
+            F("[NAVI] Destination text: "),
+            naviLongMessage.buffer,
+            naviLongMessage.length
+        );
+    }
+    else if (naviLongMessage.functionClass == 0x4C &&
+             naviLongMessage.functionId == 0x94)
+    {
+        printPrintableRuns(
+            F("[NAVI] Road text: "),
+            naviLongMessage.buffer,
+            naviLongMessage.length
+        );
+    }
+
+    resetBapLongMessage(naviLongMessage);
+}
+
+void decodePhoneNaviBap(unsigned long id, byte dlc, const byte *data)
+{
+    if (dlc == 0)
+    {
+        return;
+    }
+
+    unsigned long now = millis();
+
+    if (phoneLongMessage.active &&
+        (now - phoneLongMessage.lastFrameMs) > BAP_LONG_MESSAGE_TIMEOUT_MS)
+    {
+        finishPhoneLongMessage();
+    }
+
+    if (naviLongMessage.active &&
+        (now - naviLongMessage.lastFrameMs) > BAP_LONG_MESSAGE_TIMEOUT_MS)
+    {
+        finishNaviLongMessage();
+    }
+
+    if (id == 0x17332810UL || id == 0x17332811UL)
+    {
+        handlePhoneBap(id, dlc, data);
+        return;
+    }
+
+    if (id == 0x17333210UL || id == 0x17333211UL)
+    {
+        handleNaviBap(id, dlc, data);
+        return;
+    }
+}
+
+void handlePhoneBap(unsigned long id, byte dlc, const byte *data)
+{
+    // Short property/status frames.
+    if (dlc >= 3 && data[0] == 0x4A)
+    {
+        if (data[1] == 0x21)
+        {
+            byte active = data[2];
+
+            if (active != lastPhoneActiveFlag)
+            {
+                lastPhoneActiveFlag = active;
+
+                Serial.print(F("[PHONE] Call present/active flag = "));
+                Serial.println(active);
+
+                if (active == 0x01)
+                {
+                    Serial.println(F("[PHONE] Call session present"));
+                }
+                else if (active == 0x00)
+                {
+                    Serial.println(F("[PHONE] No active call"));
+                }
+            }
+
+            return;
+        }
+
+        if (data[1] == 0x19)
+        {
+            Serial.print(F("[PHONE] Call transition 0x19 = 0x"));
+            if (data[2] < 0x10) Serial.print('0');
+            Serial.println(data[2], HEX);
+            return;
+        }
+    }
+
+    // Segmented BAP start frames. Captures use 0x80/0x90 variants.
+    if ((data[0] & 0xF0) == 0x80 || (data[0] & 0xF0) == 0x90)
+    {
+        if (dlc < 4 || data[2] != 0x4A)
+        {
+            return;
+        }
+
+        if (phoneLongMessage.active)
+        {
+            finishPhoneLongMessage();
+        }
+
+        resetBapLongMessage(phoneLongMessage);
+        phoneLongMessage.active = true;
+        phoneLongMessage.canId = id;
+        phoneLongMessage.functionClass = data[2];
+        phoneLongMessage.functionId = data[3];
+        phoneLongMessage.continuationFamily =
+            ((data[0] & 0xF0) == 0x90) ? 0xD0 : 0xC0;
+        phoneLongMessage.lastFrameMs = millis();
+
+        appendBapLongBytes(phoneLongMessage, data, 4, dlc);
+
+        if (data[3] == 0x16 && dlc >= 5)
+        {
+            byte state = data[4];
+
+            if (state != lastPhoneCallState)
+            {
+                lastPhoneCallState = state;
+
+                Serial.print(F("[PHONE] Call state 0x16 = 0x"));
+                if (state < 0x10) Serial.print('0');
+                Serial.println(state, HEX);
+
+                // Capture-derived state labels. Keep raw state in output because
+                // sub-state meaning is not yet fully proven.
+                if ((state & 0xF0) == 0x10)
+                {
+                    Serial.println(F("[PHONE] Incoming/ringing state"));
+                }
+                else if ((state & 0xF0) == 0x20)
+                {
+                    Serial.println(F("[PHONE] Call answered/active transition"));
+                }
+                else if ((state & 0xF0) == 0x40)
+                {
+                    Serial.println(F("[PHONE] Disconnect/hangup transition"));
+                }
+                else if (state == 0x00)
+                {
+                    Serial.println(F("[PHONE] Call state idle"));
+                }
+            }
+        }
+
+        // Some messages are short enough to contain everything in the first
+        // frame. Finish only known fixed-state messages; text messages wait for
+        // Cx/Dx continuations or timeout.
+        if (data[3] == 0x16)
+        {
+            finishPhoneLongMessage();
+        }
+
+        return;
+    }
+
+    // Only accept continuation frames belonging to this transfer family.
+    //
+    // Capture-derived transport behavior:
+    //   0x8x start -> Cx continuation
+    //   0x9x start -> Dx continuation
+    //
+    // A previous decoder accepted both families. During caller-name transfer
+    // this inserted an unrelated C1 00 00... frame between "THU" and "IS",
+    // producing "THU" instead of "THUIS".
+    if (phoneLongMessage.active &&
+        id == phoneLongMessage.canId &&
+        (data[0] & 0xF0) == phoneLongMessage.continuationFamily)
+    {
+        appendBapLongBytes(phoneLongMessage, data, 1, dlc);
+        return;
+    }
+}
+
+void handleNaviBap(unsigned long id, byte dlc, const byte *data)
+{
+    // Route/navigation state candidate captured on 0x17333210.
+    if (dlc >= 3 && data[0] == 0x4C)
+    {
+        if (data[1] == 0x95)
+        {
+            byte active = data[dlc - 1];
+
+            if (active != lastNaviRouteActive)
+            {
+                lastNaviRouteActive = active;
+
+                Serial.print(F("[NAVI] Route state 0x95 = 0x"));
+                if (active < 0x10) Serial.print('0');
+                Serial.println(active, HEX);
+
+                if (active != 0x00)
+                {
+                    Serial.println(F("[NAVI] Route guidance appears active"));
+                }
+                else
+                {
+                    Serial.println(F("[NAVI] Route guidance appears stopped"));
+                }
+            }
+
+            return;
+        }
+
+        if (data[1] == 0x91 ||
+            data[1] == 0x92 ||
+            data[1] == 0x98)
+        {
+            Serial.print(F("[NAVI] State/reset field 0x"));
+            if (data[1] < 0x10) Serial.print('0');
+            Serial.print(data[1], HEX);
+            Serial.print(F(": "));
+
+            for (byte i = 2; i < dlc; i++)
+            {
+                if (data[i] < 0x10) Serial.print('0');
+                Serial.print(data[i], HEX);
+                if (i + 1 < dlc) Serial.print(' ');
+            }
+
+            Serial.println();
+            return;
+        }
+    }
+
+    // Segmented navigation text/application data.
+    if ((data[0] & 0xF0) == 0x80 || (data[0] & 0xF0) == 0x90)
+    {
+        if (dlc < 4)
+        {
+            return;
+        }
+
+        if (data[2] != 0x4C && data[2] != 0x3C)
+        {
+            return;
+        }
+
+        if (naviLongMessage.active)
+        {
+            finishNaviLongMessage();
+        }
+
+        resetBapLongMessage(naviLongMessage);
+        naviLongMessage.active = true;
+        naviLongMessage.canId = id;
+        naviLongMessage.functionClass = data[2];
+        naviLongMessage.functionId = data[3];
+        naviLongMessage.continuationFamily =
+            ((data[0] & 0xF0) == 0x90) ? 0xD0 : 0xC0;
+        naviLongMessage.lastFrameMs = millis();
+
+        appendBapLongBytes(naviLongMessage, data, 4, dlc);
+
+        if (data[2] == 0x4C && data[3] == 0x94)
+        {
+            Serial.println(F("[NAVI] Road/street text update"));
+        }
+        else if (data[2] == 0x4C && data[3] == 0xAE)
+        {
+            Serial.println(F("[NAVI] Destination/address update"));
+        }
+
+        // Non-text short frames do not need to remain open.
+        if (!((data[2] == 0x4C && data[3] == 0x94) ||
+              (data[2] == 0x4C && data[3] == 0xAE)))
+        {
+            finishNaviLongMessage();
+        }
+
+        return;
+    }
+
+    if (naviLongMessage.active &&
+        id == naviLongMessage.canId &&
+        (data[0] & 0xF0) == naviLongMessage.continuationFamily)
+    {
+        appendBapLongBytes(naviLongMessage, data, 1, dlc);
+
+        // Finalization happens on timeout or at the next segmented start.
+        return;
+    }
+}
+
 
 void decodeAsciiTransport(unsigned long id, byte dlc, const byte *data)
 {
@@ -2140,6 +3068,279 @@ void printAsciiPayload(const byte *data, byte startIndex, byte dlc)
     }
 }
 
+
+
+static bool isAsciiDigitByte(byte value)
+{
+    return value >= '0' && value <= '9';
+}
+
+static void trimAsciiRun(char *text)
+{
+    size_t len = strlen(text);
+
+    while (len > 0 && text[len - 1] == ' ')
+    {
+        text[--len] = '\0';
+    }
+
+    size_t start = 0;
+    while (text[start] == ' ')
+    {
+        start++;
+    }
+
+    if (start > 0)
+    {
+        memmove(text, text + start, strlen(text + start) + 1);
+    }
+}
+
+static bool looksLikeFmFrequency(const char *value)
+{
+    // Captures contain values such as 95.5, 99.0, 101.2, 103.7, 104.6.
+    // Keep this deliberately conservative so normal RDS text is not
+    // accidentally labelled as a frequency.
+    size_t len = strlen(value);
+    if (len < 4 || len > 6)
+    {
+        return false;
+    }
+
+    bool dotSeen = false;
+    byte digitCount = 0;
+
+    for (size_t i = 0; i < len; i++)
+    {
+        if (value[i] == '.')
+        {
+            if (dotSeen)
+            {
+                return false;
+            }
+            dotSeen = true;
+            continue;
+        }
+
+        if (value[i] < '0' || value[i] > '9')
+        {
+            return false;
+        }
+
+        digitCount++;
+    }
+
+    return dotSeen && digitCount >= 3;
+}
+
+static void finishRadioLongMessage()
+{
+    if (!radioLongMessage.active)
+    {
+        return;
+    }
+
+    if (radioLongMessage.functionClass == 0x4C &&
+        radioLongMessage.functionId == 0x55)
+    {
+        char station[24] = {0};
+        char frequency[12] = {0};
+
+        // Capture-derived 0x55 layout:
+        //   byte 0      = station/RDS name length
+        //   bytes 1..N = station/RDS name
+        //
+        // Examples:
+        //   03 68 72 31       -> "hr1"
+        //   06 70 6C 61 6E 65 74 -> "planet"
+        byte nameLength = radioLongMessage.buffer[0];
+
+        if (nameLength > 0 &&
+            nameLength < sizeof(station) &&
+            (byte)(1 + nameLength) <= radioLongMessage.length)
+        {
+            bool validName = true;
+
+            for (byte i = 0; i < nameLength; i++)
+            {
+                byte value = radioLongMessage.buffer[1 + i];
+
+                if (value < 0x20 || value > 0x7E)
+                {
+                    validName = false;
+                    break;
+                }
+
+                station[i] = (char)value;
+            }
+
+            station[nameLength] = '\0';
+
+            if (!validName)
+            {
+                station[0] = '\0';
+            }
+        }
+
+        // Frequency is also present as printable ASCII later in the same
+        // payload. Search only after the station-name field, so bytes such as
+        // 0x44 in the binary structure cannot become part of the station name.
+        byte searchStart = 1;
+        if (nameLength < radioLongMessage.length)
+        {
+            searchStart = 1 + nameLength;
+        }
+
+        for (byte i = searchStart; i < radioLongMessage.length; )
+        {
+            if (radioLongMessage.buffer[i] < 0x20 ||
+                radioLongMessage.buffer[i] > 0x7E)
+            {
+                i++;
+                continue;
+            }
+
+            char run[20] = {0};
+            byte out = 0;
+
+            while (i < radioLongMessage.length &&
+                   radioLongMessage.buffer[i] >= 0x20 &&
+                   radioLongMessage.buffer[i] <= 0x7E &&
+                   out < sizeof(run) - 1)
+            {
+                run[out++] = (char)radioLongMessage.buffer[i++];
+            }
+
+            run[out] = '\0';
+            trimAsciiRun(run);
+
+            if (looksLikeFmFrequency(run))
+            {
+                strncpy(frequency, run, sizeof(frequency) - 1);
+                break;
+            }
+        }
+
+        if (station[0] != '\0')
+        {
+            Serial.print(F("[RADIO] Station: "));
+            Serial.println(station);
+        }
+
+        if (frequency[0] != '\0')
+        {
+            Serial.print(F("[RADIO] Frequency: "));
+            Serial.print(frequency);
+            Serial.println(F(" MHz"));
+        }
+
+        if (station[0] == '\0' && frequency[0] == '\0')
+        {
+            printPrintableRuns(
+                F("[RADIO] Text: "),
+                radioLongMessage.buffer,
+                radioLongMessage.length
+            );
+        }
+    }
+
+    resetBapLongMessage(radioLongMessage);
+}
+
+void decodeRadioBap(unsigned long id, byte dlc, const byte *data)
+{
+    if ((id != 0x17333110UL && id != 0x17333111UL) || dlc == 0)
+    {
+        return;
+    }
+
+    unsigned long now = millis();
+
+    if (radioLongMessage.active &&
+        (now - radioLongMessage.lastFrameMs) > BAP_LONG_MESSAGE_TIMEOUT_MS)
+    {
+        finishRadioLongMessage();
+    }
+
+    // 0x4C 0x50 changes with the selected FM station/preset.
+    // In the capture the final byte increments 01,02,03,... while switching
+    // between hr1, hr2, hr3, hr4, FFH, planet, etc.
+    if (id == 0x17333111UL &&
+        dlc >= 3 &&
+        data[0] == 0x4C &&
+        data[1] == 0x50)
+    {
+        byte index = data[dlc - 1];
+
+        if (index != lastRadioPresetIndex)
+        {
+            lastRadioPresetIndex = index;
+            Serial.print(F("[RADIO] Preset/index: "));
+            Serial.println(index);
+        }
+
+        return;
+    }
+
+    // Related radio context/status. Meaning is not yet proven, so retain the
+    // raw value without assigning a stronger label.
+    if (id == 0x17333110UL &&
+        dlc >= 4 &&
+        (data[0] & 0xF0) == 0x80 &&
+        data[2] == 0x4C &&
+        data[3] == 0x56)
+    {
+        Serial.print(F("[RADIO] Context 0x56:"));
+        for (byte i = 4; i < dlc; i++)
+        {
+            Serial.print(' ');
+            if (data[i] < 0x10) Serial.print('0');
+            Serial.print(data[i], HEX);
+        }
+        Serial.println();
+        return;
+    }
+
+    // FM/RDS station information: segmented BAP function 0x55.
+    // Captured examples:
+    //   hr1    + 99.0 MHz
+    //   hr2    + 95.5 MHz
+    //   hr3    + 101.2 MHz
+    //   FFH    + 103.7 MHz
+    //   planet + 104.6 MHz
+    if ((data[0] & 0xF0) == 0x80 || (data[0] & 0xF0) == 0x90)
+    {
+        if (dlc < 4 || data[2] != 0x4C || data[3] != 0x55)
+        {
+            return;
+        }
+
+        if (radioLongMessage.active)
+        {
+            finishRadioLongMessage();
+        }
+
+        resetBapLongMessage(radioLongMessage);
+        radioLongMessage.active = true;
+        radioLongMessage.canId = id;
+        radioLongMessage.functionClass = data[2];
+        radioLongMessage.functionId = data[3];
+        radioLongMessage.continuationFamily =
+            ((data[0] & 0xF0) == 0x90) ? 0xD0 : 0xC0;
+        radioLongMessage.lastFrameMs = now;
+
+        appendBapLongBytes(radioLongMessage, data, 4, dlc);
+        return;
+    }
+
+    if (radioLongMessage.active &&
+        id == radioLongMessage.canId &&
+        (data[0] & 0xF0) == radioLongMessage.continuationFamily)
+    {
+        appendBapLongBytes(radioLongMessage, data, 1, dlc);
+        return;
+    }
+}
 
 
 void decodeMediaMetadata(unsigned long id, byte dlc, const byte *data)
@@ -2483,65 +3684,141 @@ void decodeVehicleStatusProbe(unsigned long id, byte dlc, const byte *data)
 
 void sendBcConfig()
 {
-    // Captured from a working MQB Bordcomputer provider on 0x17330F10.
-    const byte response[8] = {
-        0x33, 0xC2,
+    // Capture-derived BC_MFA / logical channel 0x27 BAP_Config.
+    //
+    // MIB request:
+    //   0x17332700  19 C2
+    //
+    // Provider response captured on:
+    //   0x17332710  39 C2 03 00 27 00 03 03
+    const byte response[8] =
+    {
+        0x39, 0xC2,
         0x03, 0x00,
-        0x0F, 0x00,
-        0x06, 0x06
+        0x27, 0x00,
+        0x03, 0x03
     };
 
-    sendRawCan(0x17330F10UL, true, 8, response);
-    Serial.println(F("[BC] BAP_Config 33 C2 03 00 0F 00 06 06"));
+    sendRawCan(0x17332710UL, true, 8, response);
+    bcLastConfigMs = millis();
+
+    Serial.println(
+        F("[BC 0x27 TX] BAP_Config 39 C2 03 00 27 00 03 03")
+    );
 }
+
 
 void sendBcFunctionList()
 {
-    // Working-capture FunctionList long message (Function 0x03).
-    const byte startFrame[8] = {0x80, 0x08, 0x33, 0xC3, 0x38, 0x07, 0xEF, 0xFD};
-    const byte continuation[5] = {0xC0, 0xFF, 0x00, 0x66, 0x00};
+    // Capture-derived FunctionList for provider 0x27.
+    //
+    // Captured response:
+    //   80 08 39 C3 38 07 F8 00
+    //   C0 00 00 00 00
+    const byte startFrame[8] =
+    {
+        0x80, 0x08,
+        0x39, 0xC3,
+        0x38, 0x07,
+        0xF8, 0x00
+    };
 
-    sendRawCan(0x17330F10UL, true, 8, startFrame);
+    const byte continuation[5] =
+    {
+        0xC0, 0x00, 0x00, 0x00, 0x00
+    };
+
+    sendRawCan(0x17332710UL, true, 8, startFrame);
     delay(10);
-    sendRawCan(0x17330F10UL, true, 5, continuation);
-    Serial.println(F("[BC] FunctionList sent"));
+    sendRawCan(0x17332710UL, true, 5, continuation);
+    bcLastFunctionListMs = millis();
+
+    Serial.println(F("[BC 0x27 TX] FunctionList"));
 }
+
 
 void sendBcHeartbeatConfig()
 {
-    const byte response[3] = {0x33, 0xC4, 0x0A};
-    sendRawCan(0x17330F10UL, true, 3, response);
-    Serial.println(F("[BC] HeartbeatConfig 33 C4 0A"));
+    // Capture-derived HeartbeatConfig:
+    //   0x17332710  39 C4 0A
+    const byte response[3] =
+    {
+        0x39, 0xC4, 0x0A
+    };
+
+    sendRawCan(0x17332710UL, true, 3, response);
+    bcLastHeartbeatMs = millis();
+
+    Serial.println(F("[BC 0x27 TX] HeartbeatConfig 39 C4 0A"));
 }
+
 
 void sendBcTripDistance()
 {
-    // Capture-derived hypothesis:
-    // Function 0x39, Status (0x43), uint24 LE at 0.01 km, validity/status 0x01.
-    float km = bcTripDistanceKm;
-    if (km < 0.0f) km = 0.0f;
-    if (km > 167772.15f) km = 167772.15f;
-
-    uint32_t raw = (uint32_t)(km * 100.0f + 0.5f);
-    byte response[6] = {
-        0x43, 0xF9,
-        (byte)(raw & 0xFF),
-        (byte)((raw >> 8) & 0xFF),
-        (byte)((raw >> 16) & 0xFF),
-        0x01
-    };
-
-    sendRawCan(0x17330F10UL, true, 6, response);
+    // Experimental only.
+    //
+    // The old 0x0F-based 43 F9 reply is NOT considered valid for provider
+    // 0x27. Keep this function disabled until a real 0x27 request/response
+    // for the desired trip property has been identified in the capture.
+    Serial.println(
+        F("[BC 0x27] Trip-data reply not sent: function mapping not confirmed")
+    );
 }
+
+
+void updateBcProviderManagement()
+{
+    if (!bcProviderEnabled)
+    {
+        return;
+    }
+
+    unsigned long now = millis();
+
+    // Initial advertisement during MIB startup/discovery.
+    if (bcStartupSequencePending)
+    {
+        sendBcConfig();
+        delay(20);
+
+        sendBcFunctionList();
+        delay(20);
+
+        sendBcHeartbeatConfig();
+
+        bcStartupSequencePending = false;
+        return;
+    }
+
+    // Capture-derived cyclic provider management.
+    if ((unsigned long)(now - bcLastConfigMs) >= BC_CONFIG_INTERVAL_MS)
+    {
+        sendBcConfig();
+    }
+
+    if ((unsigned long)(now - bcLastHeartbeatMs) >= BC_HEARTBEAT_INTERVAL_MS)
+    {
+        sendBcHeartbeatConfig();
+    }
+
+    if ((unsigned long)(now - bcLastFunctionListMs) >= BC_FUNCTION_LIST_INTERVAL_MS)
+    {
+        sendBcFunctionList();
+    }
+}
+
 
 void updateBcTripData()
 {
+    // Deliberately disabled for BC_MFA 0x27 until the actual trip property
+    // request/response mapping has been reconstructed.
     if (!bcProviderEnabled || !bcTripTestEnabled)
     {
         return;
     }
 
     unsigned long now = millis();
+
     if ((unsigned long)(now - bcTripLastSend) < BC_TRIP_INTERVAL_MS)
     {
         return;
@@ -2550,6 +3827,7 @@ void updateBcTripData()
     bcTripLastSend = now;
     sendBcTripDistance();
 }
+
 
 void processBcProvider(
     unsigned long id,
@@ -2560,44 +3838,56 @@ void processBcProvider(
 {
     if (!bcProviderEnabled ||
         !extended ||
-        id != 0x17330F00UL ||
+        id != 0x17332700UL ||
         dlc < 2)
     {
         return;
     }
 
-    Serial.print(F("[BC RX] "));
-    if (data[0] < 0x10) Serial.print('0');
-    Serial.print(data[0], HEX);
-    Serial.print(' ');
-    if (data[1] < 0x10) Serial.print('0');
-    Serial.println(data[1], HEX);
+    Serial.print(F("[BC 0x27 RX] "));
 
-    // Known BAP Get requests for LSG 0x0F standard functions.
-    if (data[0] == 0x13 && data[1] == 0xC2)
+    for (byte i = 0; i < dlc; i++)
+    {
+        if (data[i] < 0x10)
+        {
+            Serial.print('0');
+        }
+
+        Serial.print(data[i], HEX);
+
+        if (i + 1 < dlc)
+        {
+            Serial.print(' ');
+        }
+    }
+
+    Serial.println();
+
+    // Standard BAP Get requests observed for logical channel 0x27.
+    //
+    // Request header for this provider is 0x19.
+    if (data[0] == 0x19 && data[1] == 0xC2)
     {
         sendBcConfig();
         return;
     }
 
-    if (data[0] == 0x13 && data[1] == 0xC3)
+    if (data[0] == 0x19 && data[1] == 0xC3)
     {
         sendBcFunctionList();
         return;
     }
 
-    if (data[0] == 0x13 && data[1] == 0xC4)
+    if (data[0] == 0x19 && data[1] == 0xC4)
     {
         sendBcHeartbeatConfig();
         return;
     }
 
-    if (data[0] == 0x13 && data[1] == 0xF9)
-    {
-        sendBcTripDistance();
-        Serial.println(F("[BC] Function 0x39 trip candidate reply"));
-        return;
-    }
+    // Do not guess application-function replies yet.
+    // Log all other requests so the next MIB action can be mapped directly
+    // against the known-good gateway capture.
+    Serial.println(F("[BC 0x27] Unhandled request"));
 }
 
 
@@ -2734,35 +4024,79 @@ void processCommand(String command)
         return;
     }
 
+    if (command == "simulategateway on")
+    {
+        setGatewaySimulation(true);
+        return;
+    }
+
+    if (command == "simulategateway off")
+    {
+        setGatewaySimulation(false);
+        return;
+    }
+
+    if (command == "simulategateway")
+    {
+        Serial.print(F("[GATEWAY] Simulation = "));
+        Serial.println(simulateGatewayEnabled ? F("ON") : F("OFF"));
+        return;
+    }
+
+    if (command == "diagspoof on")
+    {
+        diagIdentitySpoofEnabled = true;
+        diagF197AwaitingFlowControl = false;
+
+        Serial.println(F("[DIAG] F197 component spoof = ON"));
+        Serial.println(F("[DIAG] Component = MQB-PQ-BRIDGE"));
+        Serial.println(F("[DIAG] Warning: single-CAN bench mode only."));
+        return;
+    }
+
+    if (command == "diagspoof off")
+    {
+        diagIdentitySpoofEnabled = false;
+        diagF197AwaitingFlowControl = false;
+
+        Serial.println(F("[DIAG] F197 component spoof = OFF"));
+        return;
+    }
+
+    if (command == "diagspoof")
+    {
+        Serial.print(F("[DIAG] F197 component spoof = "));
+        Serial.println(diagIdentitySpoofEnabled ? F("ON") : F("OFF"));
+        Serial.println(F("[DIAG] Component = MQB-PQ-BRIDGE"));
+        return;
+    }
+
     if (command == "bcprov on")
     {
         bcProviderEnabled = true;
-        Serial.println(F("[BC] ON"));
+        bcStartupSequencePending = true;
+        bcLastConfigMs = 0;
+        bcLastFunctionListMs = 0;
+        bcLastHeartbeatMs = 0;
+
+        Serial.println(F("[BC 0x27] Provider = ON"));
         return;
     }
 
     if (command == "bcprov off")
     {
         bcProviderEnabled = false;
-        Serial.println(F("[BC] OFF"));
+        bcStartupSequencePending = false;
+
+        Serial.println(F("[BC 0x27] Provider = OFF"));
         return;
     }
 
     if (command == "bctrip on")
     {
         bcProviderEnabled = true;
-        bcTripTestEnabled = true;
-        bcTripLastSend = 0;
-        sendBcConfig();
-        delay(10);
-        sendBcFunctionList();
-        delay(10);
-        sendBcHeartbeatConfig();
-        delay(10);
-        sendBcTripDistance();
-        Serial.print(F("[BC] Trip test ON, candidate distance = "));
-        Serial.print(bcTripDistanceKm, 2);
-        Serial.println(F(" km"));
+        bcTripTestEnabled = false;
+        Serial.println(F("[BC 0x27] Trip TX disabled until function mapping is confirmed"));
         return;
     }
 
@@ -2776,18 +4110,18 @@ void processCommand(String command)
     if (command.startsWith("bctrip "))
     {
         float km = command.substring(7).toFloat();
+
         if (km < 0.0f) km = 0.0f;
         if (km > 167772.15f) km = 167772.15f;
 
         bcTripDistanceKm = km;
         bcProviderEnabled = true;
-        bcTripTestEnabled = true;
-        bcTripLastSend = 0;
-        sendBcTripDistance();
+        bcTripTestEnabled = false;
 
-        Serial.print(F("[BC] Function 0x39 candidate distance = "));
+        Serial.print(F("[BC 0x27] Stored test distance = "));
         Serial.print(bcTripDistanceKm, 2);
         Serial.println(F(" km"));
+        Serial.println(F("[BC 0x27] Not transmitted: function mapping not confirmed"));
         return;
     }
 
@@ -3747,7 +5081,8 @@ void printMessages()
 void printHelp()
 {
     Serial.println();
-    Serial.println(F("MQB Emulator ESP32-S3 v1.1.0 TripData Lab"));
+    Serial.println(F("MQB Emulator ESP32-S3 v1.1.8 + Phone/Navi BAP Decoder"));
+    Serial.println(F("simulategateway on/off | simulategateway"));
     Serial.println(F("on/off | engine on/off | rpm <n>"));
     Serial.println(F("lights on/off | dimming <0-100>"));
     Serial.println(F("speed/outside/fuel | handbrake/reverse on/off"));
@@ -3756,8 +5091,9 @@ void printHelp()
     Serial.println(F("feedback | ascii on/off | media on/off"));
     Serial.println(F("abslamp/esplamp/mil/oilwarn on/off"));
     Serial.println(F("enginewarn/airbaglamp/steeringlamp on/off"));
-    Serial.println(F("statuswatch on/off | bcprov on/off"));
-    Serial.println(F("bctrip on/off | bctrip <km>  (Function 0x39 test)"));
+    Serial.println(F("statuswatch on/off | bcprov on/off  (BC_MFA 0x27)"));
+    Serial.println(F("diagspoof on/off | diagspoof  (VCDS F197 bench test)"));
+    Serial.println(F("bctrip <km>  (store only; TX disabled until 0x27 mapping is confirmed)"));
     Serial.println(F("monitor all/rx/tx/diag/off"));
     Serial.println(F("canstats"));
     Serial.println(F("state | messages | mark | help"));

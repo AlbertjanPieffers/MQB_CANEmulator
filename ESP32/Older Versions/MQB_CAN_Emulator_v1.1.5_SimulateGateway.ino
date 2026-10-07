@@ -1,37 +1,89 @@
-#include <SPI.h>
-#include <mcp_can.h>
+#include <Arduino.h>
+#include "driver/twai.h"
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <ArduinoOTA.h>
 
 /*
- * MQB CAN Bench Simulator v6.4.5 MFSW + media metadata
+ * MQB CAN Emulator v1.1.5
+ * ESP32-S3 + external CAN transceiver (e.g. SN65HVD230)
  *
- * Hardware:
- *   Arduino + MCP2515
+ * This is a single-bus MQB Infotainment CAN emulator.
+ * There is NO PQ bus and NO PQ<->MQB translation layer in this version.
  *
  * CAN:
  *   500 kbit/s
- *   MCP2515 oscillator: 16 MHz
- *   CS pin: 10
+ *   Classic CAN / CAN 2.0
+ *   ESP32-S3 internal TWAI controller
  *
- * Periodic messages:
- *   0x3C0 Klemmen_Status_01
- *   0x3BE Motor_14
- *   0x5F0 Dimmung_01
- *   0x6B2 Diagnose_01
- *   0x643 Einheiten_01
+ * Default pins:
+ *   TWAI TX -> GPIO 5
+ *   TWAI RX -> GPIO 4
  *
- * MFSW Infotainment CAN:
- *   Golf Mk7 capture format, CAN ID 0x5BF, DLC 4
+ * Change CAN_TX_PIN / CAN_RX_PIN below to match your wiring.
  *
- * Serial:
- *   115200 baud
+ * Existing MQB emulator functions are ported from the Uno project,
+ * including MFSW, vehicle state, media/phone feedback decoding,
+ * status watch and the experimental Bordcomputer LSG 0x0F probe.
+ *
+ * Network:
+ *   Wi-Fi station mode if credentials are configured.
+ *   Fallback access point otherwise.
+ *
+ * OTA:
+ *   ArduinoOTA
+ *   Browser firmware upload at /update
+ *
+ * Web UI:
+ *   Dashboard and controls at /
+ *   JSON state at /api/state
+ *   Existing serial commands via /api/command?cmd=...
  */
 
-#define CAN_CS_PIN 10
+// ============================================================
+// ESP32-S3 TWAI PIN CONFIGURATION
+// ============================================================
 
-MCP_CAN CAN(CAN_CS_PIN);
+static constexpr gpio_num_t CAN_TX_PIN = GPIO_NUM_17;
+static constexpr gpio_num_t CAN_RX_PIN = GPIO_NUM_18;
 
-const byte CAN_SPEED = CAN_500KBPS;
-const byte CAN_CLOCK = MCP_16MHZ;
+// ============================================================
+// NETWORK / OTA SETTINGS
+// ============================================================
+
+// Leave empty to start the fallback access point immediately.
+static const char *WIFI_SSID = "";
+static const char *WIFI_PASSWORD = "";
+
+static const char *AP_SSID = "MQB-Emulator";
+static const char *AP_PASSWORD = "change-me-123";
+
+static const char *OTA_HOSTNAME = "mqb-emulator";
+static const char *OTA_PASSWORD = "change-me-ota";
+
+// ============================================================
+// CAN / WEB STATE
+// ============================================================
+
+bool canReady = false;
+
+uint32_t canRxCount = 0;
+uint32_t canTxCount = 0;
+uint32_t canTxErrorCount = 0;
+
+WebServer webServer(80);
+bool webReady = false;
+bool otaReady = false;
+
+String networkMode = "OFF";
+IPAddress networkIp;
+
+// Master switch for the bench gateway replacement.
+// Default ON so the MIB can wake and see the captured vehicle-state traffic
+// immediately after power-up.
+bool simulateGatewayEnabled = true;
 
 
 // ============================================================
@@ -182,24 +234,6 @@ BenchVehicleData benchData =
 };
 
 byte kombi01Counter = 0;
-byte rearLightCounter = 0;
-
-// Parkhilfe_01 (0x497) experimental state.
-struct ParkhilfeState
-{
-    bool enabled;
-    bool opticalFront;
-    bool opticalRear;
-    bool obstacleFront;
-    bool obstacleRear;
-    bool triggerDisplay;
-    byte systemState;
-    byte displayRequest;
-};
-
-ParkhilfeState parkhilfe = { false, true, true, true, true, true, 1, 1 };
-
-
 // ============================================================
 // EXTENDED DBC VEHICLE DATA - LOW SRAM
 // ============================================================
@@ -336,10 +370,69 @@ byte asciiPrintedLength = 0;
 // For this capture that maps cleanly to Title / Artist / Album.
 bool mediaMetadataEnabled = true;
 bool mediaMessageActive = false;
-byte mediaBuffer[96];
+byte mediaBuffer[56];
 byte mediaBufferLength = 0;
 byte mediaExpectedSequence = 0;
 unsigned long mediaLastFrameMs = 0;
+
+// Vehicle-status discovery window.
+// A warning/status command can arm a short capture window so only the
+// interesting Infotainment/BAP traffic after that change is printed.
+bool vehicleStatusProbeEnabled = true;
+bool vehicleStatusProbeActive = false;
+unsigned long vehicleStatusProbeUntil = 0;
+const unsigned long VEHICLE_STATUS_PROBE_MS = 3000UL;
+
+// Minimal experimental LSG 0x0F Bordcomputer provider probe.
+bool bcProviderEnabled = false;
+
+// Bordcomputer / trip-data laboratory.
+// Function 0x39 is a strong capture-derived candidate for trip distance.
+bool bcTripTestEnabled = false;
+float bcTripDistanceKm = 123.40f;
+unsigned long bcTripLastSend = 0;
+static const unsigned long BC_TRIP_INTERVAL_MS = 1000UL;
+
+// Suppress repeated identical ACK lines.
+bool volumeAckKnown = false;
+byte lastVolumeAck = 0;
+
+
+// ============================================================
+// VCDS / UDS COMPONENT IDENTITY SPOOF - BENCH SUPPORT
+// ============================================================
+//
+// Captured 5F diagnostic pair:
+//   Tester -> 5F : 0x773
+//   5F -> Tester : 0x7DD
+//
+// VCDS reads the component text with:
+//   22 F1 97
+//
+// The real MIB returns:
+//   "MU-S-N-ER    "
+//
+// This bench implementation can answer with:
+//   "MQB-PQ-BRIDGE"
+//
+// IMPORTANT:
+// This firmware currently has only one CAN interface. Therefore it cannot
+// suppress the real MIB response when the MIB is connected to the same bus.
+// Keep this feature OFF when benching with the real MIB on the same bus.
+//
+// In the future dual-CAN bridge version this same handler should be used on
+// the PQ-facing side while DID F197 from the MIB-facing side is filtered.
+//
+
+static constexpr unsigned long VCDS_5F_REQUEST_ID  = 0x773UL;
+static constexpr unsigned long VCDS_5F_RESPONSE_ID = 0x7DDUL;
+
+bool diagIdentitySpoofEnabled = false;
+bool diagF197AwaitingFlowControl = false;
+
+// F197 contains 13 ASCII characters in this test response.
+static const char DIAG_COMPONENT_NAME[14] = "MQB-PQ-BRIDGE";
+
 
 void decodeInfotainmentFeedback(
     unsigned long id,
@@ -357,6 +450,17 @@ void resetMediaMetadata();
 void appendMediaBytes(const byte *data, byte startIndex, byte dlc);
 void tryPrintMediaMetadata();
 void printMediaField(const __FlashStringHelper *label, const byte *data, byte len);
+
+const __FlashStringHelper *mfswButtonName(byte code);
+void armVehicleStatusProbe(const __FlashStringHelper *reason);
+void decodeVehicleStatusProbe(unsigned long id, byte dlc, const byte *data);
+void processBcProvider(unsigned long id, bool extended, byte dlc, const byte *data);
+void printCompactExtFrame(
+    const __FlashStringHelper *prefix,
+    unsigned long id,
+    byte dlc,
+    const byte *data
+);
 
 
 // ============================================================
@@ -424,12 +528,19 @@ void updateEinheiten01(CanMessage &message);
 void updateBCM01(CanMessage &message);
 void updateKombi01(CanMessage &message);
 void updateKombi02(CanMessage &message);
-void updateRearLight01(CanMessage &message);
-void updateParkhilfe01(CanMessage &message);
 
 void sendMessages();
 bool sendCanMessage(CanMessage &message);
-bool sendRawCan(unsigned long id, bool extended, byte dlc, byte *data);
+bool sendRawCan(unsigned long id, bool extended, byte dlc, const byte *data);
+
+void processDiagnosticSpoof(
+    unsigned long id,
+    bool extended,
+    byte dlc,
+    const byte *data
+);
+void sendDiagF197FirstFrame();
+void sendDiagF197ConsecutiveFrames();
 
 void updateClock();
 void incrementClockOneSecond();
@@ -449,6 +560,96 @@ void sendMfswIdle();
 
 CanMessage messages[] =
 {
+    // Captured Gateway Network Management / node-presence frame.
+    // Bench use only with the physical MQB gateway disconnected.
+    // Together with Klemmen_Status_01 below this is the first gateway-wake test.
+    {
+        "Gateway_NM",
+        0x1B000010UL,
+        true,
+        8,
+        200,
+        0,
+        true,
+        {0x10, 0x00, 0x04, 0x02, 0x19, 0x00, 0x00, 0x00},
+        NULL
+    },
+
+    // Capture-exact vehicle-state frames present with the real gateway/vehicle
+    // network and absent during the first ESP32-only test.
+    // Kept static in v1.1.5 so this test isolates the missing wake/status layer.
+    {
+        "GatewayCapture_3DA",
+        0x3DA,
+        false,
+        8,
+        100,
+        0,
+        true,
+        {0x3F, 0x18, 0x00, 0xFE, 0xFF, 0xF1, 0xFF, 0x00},
+        NULL
+    },
+
+    {
+        "GatewayCapture_3DB",
+        0x3DB,
+        false,
+        8,
+        100,
+        0,
+        true,
+        {0xFE, 0x03, 0x00, 0x00, 0x80, 0x00, 0x00, 0xFE},
+        NULL
+    },
+
+    {
+        "GatewayCapture_3DC",
+        0x3DC,
+        false,
+        8,
+        50,
+        0,
+        true,
+        {0xFF, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00},
+        NULL
+    },
+
+    {
+        "GatewayCapture_3EA",
+        0x3EA,
+        false,
+        8,
+        200,
+        0,
+        true,
+        {0x0F, 0x00, 0x00, 0x40, 0x86, 0xFF, 0x00, 0x00},
+        NULL
+    },
+
+    {
+        "GatewayCapture_585",
+        0x585,
+        false,
+        8,
+        1000,
+        0,
+        true,
+        {0x02, 0x3C, 0xA0, 0x7F, 0x13, 0x00, 0x00, 0x00},
+        NULL
+    },
+
+    {
+        "GatewayCapture_663",
+        0x663,
+        false,
+        8,
+        100,
+        0,
+        true,
+        {0x70, 0x28, 0x01, 0x0E, 0x5F, 0x87, 0x00, 0x04},
+        NULL
+    },
+
     {
         "Klemmen_Status_01",
         0x3C0,
@@ -549,38 +750,615 @@ CanMessage messages[] =
         true,
         {0, 0, 0, 0, 0, 0, 0, 0},
         updateKombi02
-    },
-
-    // DBC-confirmed: Licht_hinten_01, decimal 982 = 0x3D6.
-    // Includes reverse-light-active state.
-    {
-        "Licht_hinten_01",
-        0x3D6,
-        false,
-        8,
-        100,
-        0,
-        true,
-        {0, 0, 0, 0, 0, 0, 0, 0},
-        updateRearLight01
-    }
-,
-
-    // DBC-confirmed: Parkhilfe_01, decimal 1175 = 0x497.
-    {
-        "Parkhilfe_01",
-        0x497,
-        false,
-        8,
-        100,
-        0,
-        false,
-        {0, 0, 0, 0, 0, 0, 0, 0},
-        updateParkhilfe01
     }
 };
 
 const byte MESSAGE_COUNT = sizeof(messages) / sizeof(messages[0]);
+
+
+
+// ============================================================
+// FORWARD DECLARATIONS
+// ============================================================
+//
+// Arduino normally generates function prototypes for .ino files, but the
+// combination of lambdas used by WebServer and functions declared later in
+// the sketch can prevent the generated prototypes from being sufficient.
+// Keep these explicit declarations so the ESP32-S3 build is deterministic.
+//
+
+void setBitsIntel(byte *data, byte startBit, byte length, uint32_t value);
+
+void setIgnitionOn();
+void setIgnitionOff();
+
+void setGatewaySimulation(bool enabled);
+bool isGatewaySimulationMessage(const CanMessage &message);
+
+void monitorCan();
+
+bool shouldPrintRxFrame(unsigned long id, bool extended);
+void printCanFrame(
+    const char *direction,
+    unsigned long id,
+    bool extended,
+    byte dlc,
+    const byte *data
+);
+
+void processSerial();
+void processCommand(String command);
+
+bool parseOnOff(String value, bool &result);
+
+void printState();
+void printLighting();
+void printClock();
+void printMfsw();
+void printMessages();
+void printHelp();
+void sendBcConfig();
+void sendBcFunctionList();
+void sendBcHeartbeatConfig();
+void sendBcTripDistance();
+void updateBcTripData();
+
+// ============================================================
+// ESP32-S3 CAN / WIFI / WEB / OTA INFRASTRUCTURE
+// ============================================================
+
+void initCan();
+void initNetwork();
+void initWebUi();
+void initOta();
+
+String makeStateJson();
+
+void initCan()
+{
+    Serial.print(F("Initializing TWAI 500 kbit/s... "));
+
+    twai_general_config_t general =
+        TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
+
+    general.tx_queue_len = 32;
+    general.rx_queue_len = 64;
+
+    twai_timing_config_t timing = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t filter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    esp_err_t result = twai_driver_install(&general, &timing, &filter);
+
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+    {
+        Serial.print(F("install failed: "));
+        Serial.println((int)result);
+        return;
+    }
+
+    result = twai_start();
+
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+    {
+        Serial.print(F("start failed: "));
+        Serial.println((int)result);
+        return;
+    }
+
+    canReady = true;
+    Serial.println(F("OK"));
+
+    Serial.print(F("TWAI TX GPIO: "));
+    Serial.println((int)CAN_TX_PIN);
+    Serial.print(F("TWAI RX GPIO: "));
+    Serial.println((int)CAN_RX_PIN);
+    Serial.println();
+}
+
+
+// ============================================================
+// NETWORK
+// ============================================================
+
+void initNetwork()
+{
+    WiFi.mode(WIFI_MODE_NULL);
+    delay(100);
+
+    bool connected = false;
+
+    if (strlen(WIFI_SSID) > 0)
+    {
+        Serial.print(F("Connecting WiFi: "));
+        Serial.println(WIFI_SSID);
+
+        WiFi.mode(WIFI_STA);
+        WiFi.setHostname(OTA_HOSTNAME);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+        unsigned long start = millis();
+
+        while (WiFi.status() != WL_CONNECTED && (millis() - start) < 12000UL)
+        {
+            delay(250);
+            Serial.print('.');
+        }
+
+        Serial.println();
+
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            connected = true;
+            networkMode = "STA";
+            networkIp = WiFi.localIP();
+
+            Serial.print(F("WiFi connected: "));
+            Serial.println(networkIp);
+        }
+    }
+
+    if (!connected)
+    {
+        Serial.println(F("Starting fallback access point..."));
+
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+        networkMode = "AP";
+        networkIp = WiFi.softAPIP();
+
+        Serial.print(F("AP SSID: "));
+        Serial.println(AP_SSID);
+        Serial.print(F("AP IP  : "));
+        Serial.println(networkIp);
+    }
+}
+
+
+// ============================================================
+// WEB UI
+// ============================================================
+
+static const char WEB_PAGE[] PROGMEM = R"HTML(
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MQB CAN Emulator</title>
+<style>
+body{font-family:system-ui,Arial,sans-serif;margin:0;background:#111827;color:#e5e7eb}
+main{max-width:1050px;margin:auto;padding:18px}
+h1{font-size:24px;margin:0 0 6px}
+small{color:#9ca3af}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-top:16px}
+.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:14px}
+.row{display:flex;justify-content:space-between;gap:10px;margin:7px 0}
+button{border:0;border-radius:8px;padding:9px 12px;margin:4px;background:#374151;color:#fff;cursor:pointer}
+button:hover{background:#4b5563}
+input{background:#111827;color:#fff;border:1px solid #4b5563;border-radius:7px;padding:8px}
+pre{white-space:pre-wrap;word-break:break-word;background:#0b1220;padding:10px;border-radius:8px}
+a{color:#93c5fd}
+</style>
+</head>
+<body>
+<main>
+<h1>MQB CAN Emulator</h1>
+<small>ESP32-S3 · internal TWAI · Infotainment CAN</small>
+
+<div class="grid">
+<div class="card">
+<h3>Vehicle</h3>
+<div class="row"><span>Terminal 15</span><b id="t15">-</b></div>
+<div class="row"><span>Engine</span><b id="eng">-</b></div>
+<div class="row"><span>RPM</span><b id="rpm">-</b></div>
+<div class="row"><span>Speed</span><b id="speed">-</b></div>
+<div class="row"><span>Reverse</span><b id="rev">-</b></div>
+<div class="row"><span>Handbrake</span><b id="hb">-</b></div>
+<button onclick="cmd('on')">Ignition ON</button>
+<button onclick="cmd('off')">Ignition OFF</button>
+<button onclick="cmd('engine on')">Engine ON</button>
+<button onclick="cmd('engine off')">Engine OFF</button>
+</div>
+
+<div class="card">
+<h3>CAN</h3>
+<div class="row"><span>Ready</span><b id="canready">-</b></div>
+<div class="row"><span>RX</span><b id="rx">-</b></div>
+<div class="row"><span>TX</span><b id="tx">-</b></div>
+<div class="row"><span>TX errors</span><b id="txe">-</b></div>
+<button onclick="cmd('simulategateway on')">Simulate Gateway ON</button>
+<button onclick="cmd('simulategateway off')">Simulate Gateway OFF</button>
+</div>
+
+<div class="card">
+<h3>MFSW</h3>
+<button onclick="cmd('mfsw volup')">Volume +</button>
+<button onclick="cmd('mfsw voldown')">Volume -</button>
+<button onclick="cmd('mfsw previous')">Previous</button>
+<button onclick="cmd('mfsw next')">Next</button>
+<button onclick="cmd('mfsw phone')">Phone</button>
+<button onclick="cmd('mfsw voice')">Voice</button>
+<button onclick="cmd('mfsw left')">Left</button>
+<button onclick="cmd('mfsw right')">Right</button>
+<button onclick="cmd('mfsw up')">Up</button>
+<button onclick="cmd('mfsw down')">Down</button>
+<button onclick="cmd('mfsw ok')">OK</button>
+</div>
+
+<div class="card">
+<h3>Bench functions</h3>
+<button onclick="cmd('lights on')">Lights ON</button>
+<button onclick="cmd('lights off')">Lights OFF</button>
+<button onclick="cmd('reverse on')">Reverse ON</button>
+<button onclick="cmd('reverse off')">Reverse OFF</button>
+<button onclick="cmd('handbrake on')">Handbrake ON</button>
+<button onclick="cmd('handbrake off')">Handbrake OFF</button>
+<button onclick="cmd('bcprov on')">BC provider ON</button>
+<button onclick="cmd('bcprov off')">BC provider OFF</button>
+</div>
+
+<div class="card">
+<h3>Trip data lab</h3>
+<div class="row"><span>Candidate</span><b>BC Function 0x39</b></div>
+<div class="row"><span>Hypothesis</span><b>Trip distance</b></div>
+<input id="tripkm" type="number" step="0.01" value="123.40" style="width:45%">
+<button onclick="sendTrip()">Send km</button>
+<button onclick="cmd('bctrip on')">Periodic ON</button>
+<button onclick="cmd('bctrip off')">Periodic OFF</button>
+<p><small>Capture-derived test: Status 43 F9 + uint24 LE at 0.01 km + 01.</small></p>
+</div>
+
+<div class="card">
+<h3>VCDS identity</h3>
+<div class="row"><span>DID</span><b>F197</b></div>
+<div class="row"><span>Component</span><b>MQB-PQ-BRIDGE</b></div>
+<button onclick="cmd('diagspoof on')">Spoof ON</button>
+<button onclick="cmd('diagspoof off')">Spoof OFF</button>
+<p><small>Single-CAN bench test only. Do not enable while the real MIB is also replying on the same bus.</small></p>
+</div>
+
+<div class="card">
+<h3>Raw command</h3>
+<input id="raw" style="width:70%" placeholder="e.g. rpm 1200">
+<button onclick="sendRaw()">Send</button>
+<pre id="result">Ready</pre>
+</div>
+
+<div class="card">
+<h3>Firmware</h3>
+<div class="row"><span>Network</span><b id="net">-</b></div>
+<div class="row"><span>IP</span><b id="ip">-</b></div>
+<p><a href="/update">Open firmware update page</a></p>
+<p><small>ArduinoOTA is also active.</small></p>
+</div>
+</div>
+</main>
+
+<script>
+async function cmd(c){
+  const r=await fetch('/api/command?cmd='+encodeURIComponent(c));
+  result.textContent=await r.text();
+  setTimeout(refresh,120);
+}
+function sendRaw(){cmd(document.getElementById('raw').value)}
+function sendTrip(){cmd('bctrip '+document.getElementById('tripkm').value)}
+async function refresh(){
+  try{
+    const s=await (await fetch('/api/state')).json();
+    const yn=v=>v?'ON':'OFF';
+    t15.textContent=yn(s.terminal15);
+    eng.textContent=yn(s.engineRunning);
+    rpm.textContent=s.rpm;
+    speed.textContent=s.speedKph.toFixed(1)+' km/h';
+    rev.textContent=yn(s.reverse);
+    hb.textContent=yn(s.handbrake);
+    canready.textContent=yn(s.canReady);
+    rx.textContent=s.canRx;
+    tx.textContent=s.canTx;
+    txe.textContent=s.canTxErrors;
+    net.textContent=s.networkMode;
+    ip.textContent=s.ip;
+  }catch(e){}
+}
+setInterval(refresh,1000); refresh();
+</script>
+</body>
+</html>
+)HTML";
+
+String makeStateJson()
+{
+    String json;
+    json.reserve(420);
+
+    json += '{';
+
+    json += F("\"terminal15\":");
+    json += vehicle.terminal15 ? F("true") : F("false");
+
+    json += F(",\"engineRunning\":");
+    json += vehicle.engineRunning ? F("true") : F("false");
+
+    json += F(",\"rpm\":");
+    json += vehicle.engineRpm;
+
+    json += F(",\"speedKph\":");
+    json += String(benchData.speedKph, 1);
+
+    json += F(",\"reverse\":");
+    json += benchData.reverse ? F("true") : F("false");
+
+    json += F(",\"handbrake\":");
+    json += benchData.parkingBrake ? F("true") : F("false");
+
+    json += F(",\"canReady\":");
+    json += canReady ? F("true") : F("false");
+
+    json += F(",\"canRx\":");
+    json += canRxCount;
+
+    json += F(",\"canTx\":");
+    json += canTxCount;
+
+    json += F(",\"canTxErrors\":");
+    json += canTxErrorCount;
+
+    json += F(",\"networkMode\":\"");
+    json += networkMode;
+    json += '"';
+
+    json += F(",\"ip\":\"");
+    json += networkIp.toString();
+    json += '"';
+
+    json += '}';
+    return json;
+}
+
+void initWebUi()
+{
+    if (WiFi.getMode() == WIFI_MODE_NULL)
+    {
+        return;
+    }
+
+    webServer.on("/", HTTP_GET, []()
+    {
+        webServer.send_P(200, "text/html", WEB_PAGE);
+    });
+
+    webServer.on("/api/state", HTTP_GET, []()
+    {
+        webServer.send(200, "application/json", makeStateJson());
+    });
+
+    webServer.on("/api/command", HTTP_GET, []()
+    {
+        if (!webServer.hasArg("cmd"))
+        {
+            webServer.send(400, "text/plain", "Missing cmd");
+            return;
+        }
+
+        String command = webServer.arg("cmd");
+        command.trim();
+
+        if (command.length() == 0)
+        {
+            webServer.send(400, "text/plain", "Empty command");
+            return;
+        }
+
+        processCommand(command);
+
+        webServer.send(
+            200,
+            "text/plain",
+            String("Command accepted: ") + command
+        );
+    });
+
+    webServer.on("/update", HTTP_GET, []()
+    {
+        static const char UPDATE_PAGE[] PROGMEM = R"UPD(
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Firmware Update</title></head>
+<body style="font-family:system-ui;max-width:700px;margin:40px auto;padding:0 15px">
+<h2>MQB Emulator firmware update</h2>
+<p>Select a compiled ESP32-S3 firmware <code>.bin</code>.</p>
+<form method="POST" action="/update" enctype="multipart/form-data">
+<input type="file" name="update" accept=".bin" required>
+<input type="submit" value="Upload firmware">
+</form>
+<p><a href="/">Back</a></p>
+</body></html>
+)UPD";
+
+        webServer.send_P(200, "text/html", UPDATE_PAGE);
+    });
+
+    webServer.on(
+        "/update",
+        HTTP_POST,
+        []()
+        {
+            bool ok = !Update.hasError();
+
+            webServer.send(
+                ok ? 200 : 500,
+                "text/plain",
+                ok ? "Update complete. Rebooting..." : "Update failed."
+            );
+
+            if (ok)
+            {
+                delay(500);
+                ESP.restart();
+            }
+        },
+        []()
+        {
+            HTTPUpload &upload = webServer.upload();
+
+            if (upload.status == UPLOAD_FILE_START)
+            {
+                Serial.printf("Web OTA start: %s\n", upload.filename.c_str());
+
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN))
+                {
+                    Update.printError(Serial);
+                }
+            }
+            else if (upload.status == UPLOAD_FILE_WRITE)
+            {
+                if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
+                {
+                    Update.printError(Serial);
+                }
+            }
+            else if (upload.status == UPLOAD_FILE_END)
+            {
+                if (Update.end(true))
+                {
+                    Serial.printf("Web OTA complete: %u bytes\n", upload.totalSize);
+                }
+                else
+                {
+                    Update.printError(Serial);
+                }
+            }
+        }
+    );
+
+    webServer.onNotFound([]()
+    {
+        webServer.send(404, "text/plain", "Not found");
+    });
+
+    webServer.begin();
+    webReady = true;
+
+    Serial.println(F("Web UI started"));
+}
+
+
+// ============================================================
+// ARDUINO OTA
+// ============================================================
+
+void initOta()
+{
+    if (WiFi.getMode() == WIFI_MODE_NULL)
+    {
+        return;
+    }
+
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+
+    ArduinoOTA.onStart([]()
+    {
+        Serial.println(F("ArduinoOTA start"));
+    });
+
+    ArduinoOTA.onEnd([]()
+    {
+        Serial.println(F("ArduinoOTA complete"));
+    });
+
+    ArduinoOTA.onError([](ota_error_t error)
+    {
+        Serial.print(F("ArduinoOTA error: "));
+        Serial.println((unsigned int)error);
+    });
+
+    ArduinoOTA.begin();
+    otaReady = true;
+
+    Serial.println(F("ArduinoOTA started"));
+}
+
+
+// ============================================================
+// GATEWAY SIMULATION MASTER SWITCH
+// ============================================================
+
+bool isGatewaySimulationMessage(const CanMessage &message)
+{
+    if (message.extended && message.id == 0x1B000010UL)
+    {
+        return true;
+    }
+
+    if (!message.extended)
+    {
+        switch (message.id)
+        {
+            case 0x3DA:
+            case 0x3DB:
+            case 0x3DC:
+            case 0x3EA:
+            case 0x585:
+            case 0x663:
+                return true;
+        }
+    }
+
+    return false;
+}
+
+void setGatewaySimulation(bool enabled)
+{
+    simulateGatewayEnabled = enabled;
+
+    // 0x3C0 itself remains part of the normal emulator message set.
+    // The master switch changes its terminal state through the existing
+    // ignition helper.
+    if (enabled)
+    {
+        setIgnitionOn();
+    }
+    else
+    {
+        setIgnitionOff();
+    }
+
+    for (byte i = 0; i < MESSAGE_COUNT; i++)
+    {
+        if (!isGatewaySimulationMessage(messages[i]))
+        {
+            continue;
+        }
+
+        messages[i].enabled = enabled;
+
+        if (enabled)
+        {
+            messages[i].lastSend = 0;
+        }
+    }
+
+    Serial.println();
+    Serial.println(F("======================================"));
+    Serial.print(F("SIMULATE GATEWAY: "));
+    Serial.println(enabled ? F("ON") : F("OFF"));
+    Serial.println(F("======================================"));
+
+    if (enabled)
+    {
+        Serial.println(F("Gateway NM     : 0x1B000010 @ 200 ms"));
+        Serial.println(F("Ignition       : Terminal S + 15 ON via 0x3C0"));
+        Serial.println(F("Captured state : 0x3DA 0x3DB 0x3DC 0x3EA 0x585 0x663"));
+    }
+    else
+    {
+        Serial.println(F("Gateway NM and captured state replay disabled."));
+        Serial.println(F("Ignition state set OFF."));
+    }
+
+    Serial.println();
+}
 
 
 // ============================================================
@@ -594,43 +1372,30 @@ void setup()
 
     Serial.println();
     Serial.println(F("======================================"));
-    Serial.println(F("MQB CAN Bench Simulator v6.4.5 MFSW + media metadata"));
+    Serial.println(F("MQB CAN Emulator v1.1.5"));
+    Serial.println(F("ESP32-S3 / internal TWAI"));
     Serial.println(F("======================================"));
     Serial.println();
 
-    Serial.print(F("Initializing MCP2515... "));
+    initCan();
+    initNetwork();
+    initWebUi();
+    initOta();
 
-    byte result = CAN.begin(MCP_ANY, CAN_SPEED, CAN_CLOCK);
-
-    if (result != CAN_OK)
-    {
-        Serial.println(F("FAILED"));
-
-        while (true)
-        {
-            delay(1000);
-        }
-    }
-
-    Serial.println(F("OK"));
-
-    CAN.setMode(MCP_NORMAL);
-
-    Serial.println(F("CAN mode : NORMAL"));
-    Serial.println(F("CAN speed: 500 kbit/s"));
-    Serial.println(F("CAN clock: 16 MHz"));
-    Serial.println();
+    // Default bench behavior: emulate the gateway/vehicle-network presence
+    // immediately after boot. This is intentionally ON by default.
+    //
+    // IMPORTANT: use this only with the physical MQB gateway disconnected.
+    setGatewaySimulation(true);
 
     unsigned long now = millis();
 
-    // Stagger startup traffic. The previous code made every periodic frame
-    // immediately due, which filled all MCP2515 TX buffers at once.
+    // Stagger startup traffic.
     for (byte i = 0; i < MESSAGE_COUNT; i++)
     {
         messages[i].lastSend = now + ((unsigned long)i * 3UL);
     }
 
-    // Stagger the four lightweight DBC motor frames as well.
     lastMotor04 = now + 7UL;
     lastMotor07 = now + 17UL;
     lastMotor20 = now + 27UL;
@@ -641,21 +1406,40 @@ void setup()
 
     printState();
     printHelp();
+
+    Serial.println();
+
+    if (webReady)
+    {
+        Serial.print(F("Web UI: http://"));
+        Serial.print(networkIp);
+        Serial.println(F("/"));
+    }
 }
-
-
-// ============================================================
-// MAIN LOOP
-// ============================================================
 
 void loop()
 {
     updateClock();
     updateMfsw();
+
     sendMessages();
     sendExtendedVehicleMessages();
+    updateBcTripData();
+
     monitorCan();
     processSerial();
+
+    if (webReady)
+    {
+        webServer.handleClient();
+    }
+
+    if (otaReady)
+    {
+        ArduinoOTA.handle();
+    }
+
+    delay(1);
 }
 
 
@@ -725,26 +1509,36 @@ bool sendCanMessage(CanMessage &message)
     return sendRawCan(message.id, message.extended, message.dlc, message.data);
 }
 
-bool sendRawCan(unsigned long id, bool extended, byte dlc, byte *data)
+bool sendRawCan(unsigned long id, bool extended, byte dlc, const byte *data)
 {
-    // MCP2515 has only three hardware TX buffers. Several simulator frames can
-    // become due in the same loop iteration, so briefly wait/retry when all
-    // buffers are occupied instead of immediately dropping the frame.
-    byte status = CAN_FAILTX;
-
-    for (byte attempt = 0; attempt < 4; attempt++)
+    if (!canReady || dlc > 8)
     {
-        status = CAN.sendMsgBuf(id, extended ? 1 : 0, dlc, data);
-        if (status == CAN_OK) break;
-        delayMicroseconds(350);
+        return false;
     }
 
-    if (status != CAN_OK)
+    twai_message_t message = {};
+    message.identifier = id & 0x1FFFFFFFUL;
+    message.extd = extended ? 1 : 0;
+    message.rtr = 0;
+    message.data_length_code = dlc;
+
+    for (byte i = 0; i < dlc; i++)
     {
+        message.data[i] = data[i];
+    }
+
+    esp_err_t result = twai_transmit(&message, pdMS_TO_TICKS(5));
+
+    if (result != ESP_OK)
+    {
+        canTxErrorCount++;
+
         Serial.print(F("CAN TX ERROR: 0x"));
         Serial.println(id, HEX);
         return false;
     }
+
+    canTxCount++;
 
     if (monitorMode == MONITOR_ALL || monitorMode == MONITOR_TX)
     {
@@ -752,6 +1546,116 @@ bool sendRawCan(unsigned long id, bool extended, byte dlc, byte *data)
     }
 
     return true;
+}
+
+
+// ============================================================
+// VCDS / UDS DID F197 COMPONENT IDENTITY SPOOF
+// ============================================================
+
+void processDiagnosticSpoof(
+    unsigned long id,
+    bool extended,
+    byte dlc,
+    const byte *data
+)
+{
+    if (!diagIdentitySpoofEnabled ||
+        extended ||
+        id != VCDS_5F_REQUEST_ID ||
+        dlc == 0)
+    {
+        return;
+    }
+
+    // ISO-TP single-frame UDS request:
+    //   03 22 F1 97
+    if (dlc >= 4 &&
+        data[0] == 0x03 &&
+        data[1] == 0x22 &&
+        data[2] == 0xF1 &&
+        data[3] == 0x97)
+    {
+        sendDiagF197FirstFrame();
+        diagF197AwaitingFlowControl = true;
+
+        Serial.println(F("[DIAG] VCDS requested DID F197"));
+        Serial.println(F("[DIAG] Sending component identity: MQB-PQ-BRIDGE"));
+        return;
+    }
+
+    // ISO-TP flow control from tester:
+    //   30 BS STmin ...
+    if (diagF197AwaitingFlowControl &&
+        dlc >= 3 &&
+        (data[0] & 0xF0) == 0x30)
+    {
+        const byte flowStatus = data[0] & 0x0F;
+
+        if (flowStatus == 0x00)
+        {
+            sendDiagF197ConsecutiveFrames();
+        }
+        else
+        {
+            Serial.print(F("[DIAG] F197 flow control status = 0x"));
+            Serial.println(flowStatus, HEX);
+        }
+
+        diagF197AwaitingFlowControl = false;
+    }
+}
+
+void sendDiagF197FirstFrame()
+{
+    // UDS payload:
+    //   62 F1 97 + 13 ASCII bytes = 16 bytes total.
+    //
+    // ISO-TP first frame:
+    //   10 10 | 62 F1 97 | "MQB"
+    const byte frame[8] =
+    {
+        0x10, 0x10,
+        0x62, 0xF1, 0x97,
+        (byte)DIAG_COMPONENT_NAME[0],
+        (byte)DIAG_COMPONENT_NAME[1],
+        (byte)DIAG_COMPONENT_NAME[2]
+    };
+
+    sendRawCan(VCDS_5F_RESPONSE_ID, false, 8, frame);
+}
+
+void sendDiagF197ConsecutiveFrames()
+{
+    // Remaining 10 characters after "MQB":
+    //   "-PQ-BRIDGE"
+    const byte frame21[8] =
+    {
+        0x21,
+        (byte)DIAG_COMPONENT_NAME[3],
+        (byte)DIAG_COMPONENT_NAME[4],
+        (byte)DIAG_COMPONENT_NAME[5],
+        (byte)DIAG_COMPONENT_NAME[6],
+        (byte)DIAG_COMPONENT_NAME[7],
+        (byte)DIAG_COMPONENT_NAME[8],
+        (byte)DIAG_COMPONENT_NAME[9]
+    };
+
+    const byte frame22[8] =
+    {
+        0x22,
+        (byte)DIAG_COMPONENT_NAME[10],
+        (byte)DIAG_COMPONENT_NAME[11],
+        (byte)DIAG_COMPONENT_NAME[12],
+        0xAA, 0xAA, 0xAA, 0xAA
+    };
+
+    sendRawCan(VCDS_5F_RESPONSE_ID, false, 8, frame21);
+
+    // The capture used STmin = 1 ms.
+    delay(1);
+
+    sendRawCan(VCDS_5F_RESPONSE_ID, false, 8, frame22);
 }
 
 
@@ -1060,48 +1964,6 @@ void updateKombi02(CanMessage &message)
 
 
 // ============================================================
-// LICHT_HINTEN_01 - 0x3D6
-// ============================================================
-
-void updateRearLight01(CanMessage &message)
-{
-    for (byte i = 0; i < 8; i++)
-    {
-        message.data[i] = 0x00;
-    }
-
-    // Licht_hinten_01_BZ, bits 0..3.
-    setBitsIntel(message.data, 0, 4, rearLightCounter & 0x0F);
-
-    // LH_Rueckfahrlicht_aktiv, bit 13.
-    setBitsIntel(message.data, 13, 1, benchData.reverse ? 1 : 0);
-
-    rearLightCounter = (rearLightCounter + 1) & 0x0F;
-}
-
-
-// ============================================================
-// PARKHILFE_01 - 0x497
-// ============================================================
-
-void updateParkhilfe01(CanMessage &message)
-{
-    for (byte i = 0; i < 8; i++) message.data[i] = 0x00;
-
-    if (!parkhilfe.enabled) return;
-
-    // DBC signal positions from Parkhilfe_01.
-    setBitsIntel(message.data, 16, 1, parkhilfe.opticalFront ? 1 : 0);
-    setBitsIntel(message.data, 17, 1, parkhilfe.opticalRear ? 1 : 0);
-    setBitsIntel(message.data, 18, 1, parkhilfe.obstacleFront ? 1 : 0);
-    setBitsIntel(message.data, 19, 1, parkhilfe.obstacleRear ? 1 : 0);
-    setBitsIntel(message.data, 48, 1, parkhilfe.triggerDisplay ? 1 : 0);
-    setBitsIntel(message.data, 58, 3, parkhilfe.systemState & 0x07);
-    setBitsIntel(message.data, 61, 2, parkhilfe.displayRequest & 0x03);
-}
-
-
-// ============================================================
 // EXTENDED DBC MESSAGES
 // ============================================================
 
@@ -1287,9 +2149,12 @@ void startMfswEvent(byte buttonCode)
     sendMfswPressed(buttonCode);
     mfswLastSend = now;
 
-    Serial.print(F("MFSW 0x5BF press: code=0x"));
+    Serial.print(F("[MFSW] "));
+    Serial.print(mfswButtonName(buttonCode));
+    Serial.print(F(" (0x"));
     if (buttonCode < 0x10) Serial.print('0');
-    Serial.println(buttonCode, HEX);
+    Serial.print(buttonCode, HEX);
+    Serial.println(')');
 }
 
 void updateMfsw()
@@ -1393,32 +2258,41 @@ void setIgnitionOff()
 
 void monitorCan()
 {
-    while (CAN.checkReceive() == CAN_MSGAVAIL)
+    if (!canReady)
     {
-        unsigned long rawId = 0;
-        byte len = 0;
+        return;
+    }
+
+    twai_message_t rx = {};
+
+    while (twai_receive(&rx, 0) == ESP_OK)
+    {
+        canRxCount++;
+
+        bool extended = rx.extd != 0;
+        unsigned long id = rx.identifier & 0x1FFFFFFFUL;
+        byte len = rx.data_length_code;
+
+        if (len > 8)
+        {
+            len = 8;
+        }
+
         byte buffer[8] = {0};
 
-        byte result = CAN.readMsgBuf(&rawId, &len, buffer);
-
-        if (result != CAN_OK)
+        for (byte i = 0; i < len; i++)
         {
-            return;
+            buffer[i] = rx.data[i];
         }
 
-        bool extended = (rawId & 0x80000000UL) != 0;
-        unsigned long id = rawId & 0x1FFFFFFFUL;
-
-        // Decode useful infotainment feedback even when the raw CAN monitor
-        // itself is disabled. This keeps the serial output readable.
+        processDiagnosticSpoof(id, extended, len, buffer);
         decodeInfotainmentFeedback(id, extended, len, buffer);
+        processBcProvider(id, extended, len, buffer);
 
-        if (!shouldPrintRxFrame(id, extended))
+        if (shouldPrintRxFrame(id, extended))
         {
-            continue;
+            printCanFrame("RX", id, extended, len, buffer);
         }
-
-        printCanFrame("RX", id, extended, len, buffer);
     }
 }
 
@@ -1448,6 +2322,11 @@ void decodeInfotainmentFeedback(
     {
         decodeMediaMetadata(id, dlc, data);
     }
+
+    if (vehicleStatusProbeEnabled && vehicleStatusProbeActive)
+    {
+        decodeVehicleStatusProbe(id, dlc, data);
+    }
 }
 
 void decodeVolumeFeedback(byte dlc, const byte *data)
@@ -1469,28 +2348,17 @@ void decodeVolumeFeedback(byte dlc, const byte *data)
             volumeKnown = true;
             lastVolume = volume;
 
-            Serial.print(F("[VOLUME] current = "));
-            Serial.print(volume);
-            Serial.print(F(" (0x"));
-            if (volume < 0x10) Serial.print('0');
-            Serial.print(volume, HEX);
-            Serial.println(')');
+            Serial.print(F("[AUDIO] Volume = "));
+            Serial.println(volume);
             return;
         }
 
         if (volume != lastVolume)
         {
-            Serial.print(F("[VOLUME] "));
+            Serial.print(F("[AUDIO] Volume "));
             Serial.print(lastVolume);
             Serial.print(F(" -> "));
-            Serial.print(volume);
-
-            if (data[0] == 0x4C)
-            {
-                Serial.print(F("  event"));
-            }
-
-            Serial.println();
+            Serial.println(volume);
             lastVolume = volume;
         }
 
@@ -1503,8 +2371,14 @@ void decodeVolumeFeedback(byte dlc, const byte *data)
     {
         byte volume = data[5];
 
-        Serial.print(F("[VOLUME ACK] "));
-        Serial.println(volume);
+        if (!volumeAckKnown || volume != lastVolumeAck)
+        {
+            volumeAckKnown = true;
+            lastVolumeAck = volume;
+
+            Serial.print(F("[AUDIO] Volume ACK = "));
+            Serial.println(volume);
+        }
     }
 }
 
@@ -1535,17 +2409,22 @@ void decodeAsciiTransport(unsigned long id, byte dlc, const byte *data)
         asciiExpectedLength = data[4];
         asciiPrintedLength = 0;
 
-        Serial.print(F("[ASCII 0x"));
-        Serial.print(id, HEX);
-        Serial.print(F(" ch=0x"));
-        if (data[2] < 0x10) Serial.print('0');
-        Serial.print(data[2], HEX);
-        Serial.print(F(" idx=0x"));
-        if (data[3] < 0x10) Serial.print('0');
-        Serial.print(data[3], HEX);
-        Serial.print(F(" len="));
-        Serial.print(asciiExpectedLength);
-        Serial.print(F("] \""));
+        if (id == 0x17332810UL)
+        {
+            Serial.print(F("[PHONE/TEXT] \""));
+        }
+        else
+        {
+            Serial.print(F("[TEXT 0x"));
+            Serial.print(id, HEX);
+            Serial.print(F(" ch=0x"));
+            if (data[2] < 0x10) Serial.print('0');
+            Serial.print(data[2], HEX);
+            Serial.print(F(" idx=0x"));
+            if (data[3] < 0x10) Serial.print('0');
+            Serial.print(data[3], HEX);
+            Serial.print(F("] \""));
+        }
 
         printAsciiPayload(data, 5, dlc);
 
@@ -1842,6 +2721,239 @@ void tryPrintMediaMetadata()
 }
 
 
+
+const __FlashStringHelper *mfswButtonName(byte code)
+{
+    switch (code)
+    {
+        case MFSW_RIGHT_MENU:  return F("Right");
+        case MFSW_LEFT_MENU:   return F("Left");
+        case MFSW_UP:          return F("Up");
+        case MFSW_DOWN:        return F("Down");
+        case MFSW_OK:          return F("OK");
+        case MFSW_VOLUME_UP:   return F("Volume +");
+        case MFSW_VOLUME_DOWN: return F("Volume -");
+        case MFSW_NEXT:        return F("Next track");
+        case MFSW_PREVIOUS:    return F("Previous track");
+        case MFSW_VOICE:       return F("Voice");
+        case MFSW_PHONE:       return F("Phone");
+    }
+
+    return F("Unknown");
+}
+
+void printCompactExtFrame(
+    const __FlashStringHelper *prefix,
+    unsigned long id,
+    byte dlc,
+    const byte *data
+)
+{
+    Serial.print(prefix);
+    Serial.print(F(" 0x"));
+    Serial.print(id, HEX);
+    Serial.print(F("  "));
+
+    for (byte i = 0; i < dlc; i++)
+    {
+        if (data[i] < 0x10) Serial.print('0');
+        Serial.print(data[i], HEX);
+
+        if (i + 1 < dlc)
+        {
+            Serial.print(' ');
+        }
+    }
+
+    Serial.println();
+}
+
+void armVehicleStatusProbe(const __FlashStringHelper *reason)
+{
+    if (!vehicleStatusProbeEnabled)
+    {
+        return;
+    }
+
+    vehicleStatusProbeActive = true;
+    vehicleStatusProbeUntil = millis() + VEHICLE_STATUS_PROBE_MS;
+
+    Serial.println();
+    Serial.print(F("[STATUS PROBE] "));
+    Serial.println(reason);
+}
+
+void decodeVehicleStatusProbe(unsigned long id, byte dlc, const byte *data)
+{
+    unsigned long now = millis();
+
+    if ((long)(now - vehicleStatusProbeUntil) >= 0)
+    {
+        vehicleStatusProbeActive = false;
+        Serial.println(F("[STATUS PROBE] done"));
+        Serial.println();
+        return;
+    }
+
+    if (dlc == 0)
+    {
+        return;
+    }
+
+    // Candidate status data is expected on the Infotainment extended family.
+    // Skip known audio/media/text channels so the probe stays useful.
+    if ((id & 0xFFFF0000UL) != 0x17330000UL)
+    {
+        return;
+    }
+
+    if (id == 0x17333110UL ||
+        id == 0x17333111UL ||
+        id == 0x17332810UL)
+    {
+        return;
+    }
+
+    byte type = data[0];
+
+    // Favor complete property/application frames and segmented-message starts.
+    // Continuation-only traffic is intentionally suppressed.
+    if (type == 0x30 ||
+        type == 0x38 ||
+        type == 0x39 ||
+        type == 0x3A ||
+        type == 0x3C ||
+        type == 0x3D ||
+        type == 0x4C ||
+        (type & 0xF0) == 0x80 ||
+        (type & 0xF0) == 0x90)
+    {
+        printCompactExtFrame(F("[STATUS]"), id, dlc, data);
+    }
+}
+
+
+
+void sendBcConfig()
+{
+    // Captured from a working MQB Bordcomputer provider on 0x17330F10.
+    const byte response[8] = {
+        0x33, 0xC2,
+        0x03, 0x00,
+        0x0F, 0x00,
+        0x06, 0x06
+    };
+
+    sendRawCan(0x17330F10UL, true, 8, response);
+    Serial.println(F("[BC] BAP_Config 33 C2 03 00 0F 00 06 06"));
+}
+
+void sendBcFunctionList()
+{
+    // Working-capture FunctionList long message (Function 0x03).
+    const byte startFrame[8] = {0x80, 0x08, 0x33, 0xC3, 0x38, 0x07, 0xEF, 0xFD};
+    const byte continuation[5] = {0xC0, 0xFF, 0x00, 0x66, 0x00};
+
+    sendRawCan(0x17330F10UL, true, 8, startFrame);
+    delay(10);
+    sendRawCan(0x17330F10UL, true, 5, continuation);
+    Serial.println(F("[BC] FunctionList sent"));
+}
+
+void sendBcHeartbeatConfig()
+{
+    const byte response[3] = {0x33, 0xC4, 0x0A};
+    sendRawCan(0x17330F10UL, true, 3, response);
+    Serial.println(F("[BC] HeartbeatConfig 33 C4 0A"));
+}
+
+void sendBcTripDistance()
+{
+    // Capture-derived hypothesis:
+    // Function 0x39, Status (0x43), uint24 LE at 0.01 km, validity/status 0x01.
+    float km = bcTripDistanceKm;
+    if (km < 0.0f) km = 0.0f;
+    if (km > 167772.15f) km = 167772.15f;
+
+    uint32_t raw = (uint32_t)(km * 100.0f + 0.5f);
+    byte response[6] = {
+        0x43, 0xF9,
+        (byte)(raw & 0xFF),
+        (byte)((raw >> 8) & 0xFF),
+        (byte)((raw >> 16) & 0xFF),
+        0x01
+    };
+
+    sendRawCan(0x17330F10UL, true, 6, response);
+}
+
+void updateBcTripData()
+{
+    if (!bcProviderEnabled || !bcTripTestEnabled)
+    {
+        return;
+    }
+
+    unsigned long now = millis();
+    if ((unsigned long)(now - bcTripLastSend) < BC_TRIP_INTERVAL_MS)
+    {
+        return;
+    }
+
+    bcTripLastSend = now;
+    sendBcTripDistance();
+}
+
+void processBcProvider(
+    unsigned long id,
+    bool extended,
+    byte dlc,
+    const byte *data
+)
+{
+    if (!bcProviderEnabled ||
+        !extended ||
+        id != 0x17330F00UL ||
+        dlc < 2)
+    {
+        return;
+    }
+
+    Serial.print(F("[BC RX] "));
+    if (data[0] < 0x10) Serial.print('0');
+    Serial.print(data[0], HEX);
+    Serial.print(' ');
+    if (data[1] < 0x10) Serial.print('0');
+    Serial.println(data[1], HEX);
+
+    // Known BAP Get requests for LSG 0x0F standard functions.
+    if (data[0] == 0x13 && data[1] == 0xC2)
+    {
+        sendBcConfig();
+        return;
+    }
+
+    if (data[0] == 0x13 && data[1] == 0xC3)
+    {
+        sendBcFunctionList();
+        return;
+    }
+
+    if (data[0] == 0x13 && data[1] == 0xC4)
+    {
+        sendBcHeartbeatConfig();
+        return;
+    }
+
+    if (data[0] == 0x13 && data[1] == 0xF9)
+    {
+        sendBcTripDistance();
+        Serial.println(F("[BC] Function 0x39 trip candidate reply"));
+        return;
+    }
+}
+
+
 bool shouldPrintRxFrame(unsigned long id, bool extended)
 {
     switch (monitorMode)
@@ -1958,9 +3070,124 @@ void processCommand(String command)
     command.trim();
     command.toLowerCase();
 
+    if (command == "canstats")
+    {
+        Serial.print(F("CAN RX/TX/ERR: "));
+        Serial.print(canRxCount);
+        Serial.print('/');
+        Serial.print(canTxCount);
+        Serial.print('/');
+        Serial.println(canTxErrorCount);
+        return;
+    }
+
     if (command == "help")
     {
         printHelp();
+        return;
+    }
+
+    if (command == "simulategateway on")
+    {
+        setGatewaySimulation(true);
+        return;
+    }
+
+    if (command == "simulategateway off")
+    {
+        setGatewaySimulation(false);
+        return;
+    }
+
+    if (command == "simulategateway")
+    {
+        Serial.print(F("[GATEWAY] Simulation = "));
+        Serial.println(simulateGatewayEnabled ? F("ON") : F("OFF"));
+        return;
+    }
+
+    if (command == "diagspoof on")
+    {
+        diagIdentitySpoofEnabled = true;
+        diagF197AwaitingFlowControl = false;
+
+        Serial.println(F("[DIAG] F197 component spoof = ON"));
+        Serial.println(F("[DIAG] Component = MQB-PQ-BRIDGE"));
+        Serial.println(F("[DIAG] Warning: single-CAN bench mode only."));
+        return;
+    }
+
+    if (command == "diagspoof off")
+    {
+        diagIdentitySpoofEnabled = false;
+        diagF197AwaitingFlowControl = false;
+
+        Serial.println(F("[DIAG] F197 component spoof = OFF"));
+        return;
+    }
+
+    if (command == "diagspoof")
+    {
+        Serial.print(F("[DIAG] F197 component spoof = "));
+        Serial.println(diagIdentitySpoofEnabled ? F("ON") : F("OFF"));
+        Serial.println(F("[DIAG] Component = MQB-PQ-BRIDGE"));
+        return;
+    }
+
+    if (command == "bcprov on")
+    {
+        bcProviderEnabled = true;
+        Serial.println(F("[BC] ON"));
+        return;
+    }
+
+    if (command == "bcprov off")
+    {
+        bcProviderEnabled = false;
+        Serial.println(F("[BC] OFF"));
+        return;
+    }
+
+    if (command == "bctrip on")
+    {
+        bcProviderEnabled = true;
+        bcTripTestEnabled = true;
+        bcTripLastSend = 0;
+        sendBcConfig();
+        delay(10);
+        sendBcFunctionList();
+        delay(10);
+        sendBcHeartbeatConfig();
+        delay(10);
+        sendBcTripDistance();
+        Serial.print(F("[BC] Trip test ON, candidate distance = "));
+        Serial.print(bcTripDistanceKm, 2);
+        Serial.println(F(" km"));
+        return;
+    }
+
+    if (command == "bctrip off")
+    {
+        bcTripTestEnabled = false;
+        Serial.println(F("[BC] Trip test OFF"));
+        return;
+    }
+
+    if (command.startsWith("bctrip "))
+    {
+        float km = command.substring(7).toFloat();
+        if (km < 0.0f) km = 0.0f;
+        if (km > 167772.15f) km = 167772.15f;
+
+        bcTripDistanceKm = km;
+        bcProviderEnabled = true;
+        bcTripTestEnabled = true;
+        bcTripLastSend = 0;
+        sendBcTripDistance();
+
+        Serial.print(F("[BC] Function 0x39 candidate distance = "));
+        Serial.print(bcTripDistanceKm, 2);
+        Serial.println(F(" km"));
         return;
     }
 
@@ -2446,57 +3673,8 @@ void processCommand(String command)
         }
 
         benchData.reverse = value;
-        parkhilfe.enabled = value;
-        parkhilfe.triggerDisplay = value;
-        messages[MESSAGE_COUNT - 1].enabled = value;
         Serial.print(F("Reverse = "));
         Serial.println(value ? F("ON") : F("OFF"));
-        return;
-    }
-
-    if (command == "park on")
-    {
-        parkhilfe.enabled = true;
-        parkhilfe.triggerDisplay = true;
-        messages[MESSAGE_COUNT - 1].enabled = true;
-        messages[MESSAGE_COUNT - 1].lastSend = 0;
-        Serial.println(F("Parkhilfe_01 0x497 = ON"));
-        return;
-    }
-
-    if (command == "park off")
-    {
-        parkhilfe.enabled = false;
-        parkhilfe.triggerDisplay = false;
-        messages[MESSAGE_COUNT - 1].enabled = false;
-        Serial.println(F("Parkhilfe_01 0x497 = OFF"));
-        return;
-    }
-
-    if (command.startsWith("park system "))
-    {
-        int value = command.substring(12).toInt();
-        if (value < 0 || value > 7) { Serial.println(F("Usage: park system <0-7>")); return; }
-        parkhilfe.systemState = (byte)value;
-        Serial.print(F("PH_Systemzustand = ")); Serial.println(parkhilfe.systemState);
-        return;
-    }
-
-    if (command.startsWith("park display "))
-    {
-        int value = command.substring(13).toInt();
-        if (value < 0 || value > 3) { Serial.println(F("Usage: park display <0-3>")); return; }
-        parkhilfe.displayRequest = (byte)value;
-        Serial.print(F("PH_Display_Kundenwunsch = ")); Serial.println(parkhilfe.displayRequest);
-        return;
-    }
-
-    if (command.startsWith("park trigger "))
-    {
-        bool value;
-        if (!parseOnOff(command.substring(13), value)) { Serial.println(F("Usage: park trigger on/off")); return; }
-        parkhilfe.triggerDisplay = value;
-        Serial.print(F("PH_Trigger_Bildaufschaltung = ")); Serial.println(value ? F("ON") : F("OFF"));
         return;
     }
 
@@ -2511,8 +3689,9 @@ void processCommand(String command)
         }
 
         benchData.parkingBrake = value;
-        Serial.print(F("Handbrake = "));
+        Serial.print(F("[VEHICLE] Handbrake = "));
         Serial.println(value ? F("ON") : F("OFF"));
+        armVehicleStatusProbe(value ? F("Handbrake ON") : F("Handbrake OFF"));
         return;
     }
 
@@ -2689,6 +3868,32 @@ void processCommand(String command)
 
 
     // --------------------------------------------------------
+    // CLEAN SERIAL / DISCOVERY / VEHICLE STATUS HUNTER
+    // --------------------------------------------------------
+
+    if (command == "statuswatch on")
+    {
+        vehicleStatusProbeEnabled = true;
+        Serial.println(F("[SYSTEM] Vehicle-status probe = ON"));
+        return;
+    }
+
+    if (command == "statuswatch off")
+    {
+        vehicleStatusProbeEnabled = false;
+        vehicleStatusProbeActive = false;
+        Serial.println(F("[SYSTEM] Vehicle-status probe = OFF"));
+        return;
+    }
+
+    if (command == "statuswatch")
+    {
+        Serial.print(F("[SYSTEM] Vehicle-status probe = "));
+        Serial.println(vehicleStatusProbeEnabled ? F("ON") : F("OFF"));
+        return;
+    }
+
+    // --------------------------------------------------------
     // MARK / MONITOR
     // --------------------------------------------------------
 
@@ -2754,13 +3959,13 @@ void processCommand(String command)
 
     if (command.startsWith("clutch ")) { bool v;if(!parseOnOff(command.substring(7),v)){Serial.println(F("Usage: clutch on/off"));return;}extData.clutch=v;Serial.println(v?F("Clutch ON"):F("Clutch OFF"));return; }
     if (command.startsWith("kickdown ")) { bool v;if(!parseOnOff(command.substring(9),v)){Serial.println(F("Usage: kickdown on/off"));return;}extData.kickdown=v;Serial.println(v?F("Kickdown ON"):F("Kickdown OFF"));return; }
-    if (command.startsWith("mil ")) { bool v;if(!parseOnOff(command.substring(4),v)){Serial.println(F("Usage: mil on/off"));return;}extData.mil=v;Serial.println(v?F("MIL ON"):F("MIL OFF"));return; }
-    if (command.startsWith("enginewarn ")) { bool v;if(!parseOnOff(command.substring(11),v)){Serial.println(F("Usage: enginewarn on/off"));return;}extData.engineWarning=v;Serial.println(v?F("Engine warning ON"):F("Engine warning OFF"));return; }
-    if (command.startsWith("oilwarn ")) { bool v;if(!parseOnOff(command.substring(8),v)){Serial.println(F("Usage: oilwarn on/off"));return;}extData.oilWarning=v;Serial.println(v?F("Oil warning ON"):F("Oil warning OFF"));return; }
-    if (command.startsWith("abslamp ")) { bool v;if(!parseOnOff(command.substring(8),v)){Serial.println(F("Usage: abslamp on/off"));return;}extData.absLamp=v;Serial.println(v?F("ABS lamp ON"):F("ABS lamp OFF"));return; }
-    if (command.startsWith("esplamp ")) { bool v;if(!parseOnOff(command.substring(8),v)){Serial.println(F("Usage: esplamp on/off"));return;}extData.espLamp=v;Serial.println(v?F("ESP lamp ON"):F("ESP lamp OFF"));return; }
-    if (command.startsWith("airbaglamp ")) { bool v;if(!parseOnOff(command.substring(11),v)){Serial.println(F("Usage: airbaglamp on/off"));return;}extData.airbagLamp=v;Serial.println(v?F("Airbag lamp ON"):F("Airbag lamp OFF"));return; }
-    if (command.startsWith("steeringlamp ")) { bool v;if(!parseOnOff(command.substring(13),v)){Serial.println(F("Usage: steeringlamp on/off"));return;}extData.steeringLamp=v;Serial.println(v?F("Steering lamp ON"):F("Steering lamp OFF"));return; }
+    if (command.startsWith("mil ")) { bool v;if(!parseOnOff(command.substring(4),v)){Serial.println(F("Usage: mil on/off"));return;}extData.mil=v;Serial.println(v?F("[VEHICLE] MIL = ON"):F("[VEHICLE] MIL = OFF"));armVehicleStatusProbe(v?F("MIL ON"):F("MIL OFF"));return; }
+    if (command.startsWith("enginewarn ")) { bool v;if(!parseOnOff(command.substring(11),v)){Serial.println(F("Usage: enginewarn on/off"));return;}extData.engineWarning=v;Serial.println(v?F("[VEHICLE] Engine warning = ON"):F("[VEHICLE] Engine warning = OFF"));armVehicleStatusProbe(v?F("Engine warning ON"):F("Engine warning OFF"));return; }
+    if (command.startsWith("oilwarn ")) { bool v;if(!parseOnOff(command.substring(8),v)){Serial.println(F("Usage: oilwarn on/off"));return;}extData.oilWarning=v;Serial.println(v?F("[VEHICLE] Oil warning = ON"):F("[VEHICLE] Oil warning = OFF"));armVehicleStatusProbe(v?F("Oil warning ON"):F("Oil warning OFF"));return; }
+    if (command.startsWith("abslamp ")) { bool v;if(!parseOnOff(command.substring(8),v)){Serial.println(F("Usage: abslamp on/off"));return;}extData.absLamp=v;Serial.println(v?F("[VEHICLE] ABS warning = ON"):F("[VEHICLE] ABS warning = OFF"));armVehicleStatusProbe(v?F("ABS warning ON"):F("ABS warning OFF"));return; }
+    if (command.startsWith("esplamp ")) { bool v;if(!parseOnOff(command.substring(8),v)){Serial.println(F("Usage: esplamp on/off"));return;}extData.espLamp=v;Serial.println(v?F("[VEHICLE] ESP warning = ON"):F("[VEHICLE] ESP warning = OFF"));armVehicleStatusProbe(v?F("ESP warning ON"):F("ESP warning OFF"));return; }
+    if (command.startsWith("airbaglamp ")) { bool v;if(!parseOnOff(command.substring(11),v)){Serial.println(F("Usage: airbaglamp on/off"));return;}extData.airbagLamp=v;Serial.println(v?F("[VEHICLE] Airbag warning = ON"):F("[VEHICLE] Airbag warning = OFF"));armVehicleStatusProbe(v?F("Airbag warning ON"):F("Airbag warning OFF"));return; }
+    if (command.startsWith("steeringlamp ")) { bool v;if(!parseOnOff(command.substring(13),v)){Serial.println(F("Usage: steeringlamp on/off"));return;}extData.steeringLamp=v;Serial.println(v?F("[VEHICLE] Steering warning = ON"):F("[VEHICLE] Steering warning = OFF"));armVehicleStatusProbe(v?F("Steering warning ON"):F("Steering warning OFF"));return; }
 
     Serial.print(F("Unknown command: "));
     Serial.println(command);
@@ -2942,98 +4147,21 @@ void printMessages()
 void printHelp()
 {
     Serial.println();
-    Serial.println(F("Commands"));
-    Serial.println(F("--------"));
-    Serial.println(F("on"));
-    Serial.println(F("off"));
-    Serial.println(F("ignition on"));
-    Serial.println(F("ignition off"));
-    Serial.println(F("engine on"));
-    Serial.println(F("engine off"));
-    Serial.println(F("starter on"));
-    Serial.println(F("starter off"));
-    Serial.println(F("rpm <value>"));
-    Serial.println(F("startstop <0-3>"));
-    Serial.println();
-
-    Serial.println(F("terminal s on/off"));
-    Serial.println(F("terminal 15 on/off"));
-    Serial.println(F("terminal x on/off"));
-    Serial.println(F("terminal 50 on/off"));
-    Serial.println(F("terminal 75 on/off"));
-    Serial.println();
-
-    Serial.println(F("lights on"));
-    Serial.println(F("lights off"));
-    Serial.println(F("dimming <0-100>"));
-    Serial.println(F("night on/off"));
-    Serial.println(F("photosensor <0-65535>"));
-    Serial.println(F("lighting"));
-    Serial.println();
-
-    Serial.println(F("time HH:MM[:SS]"));
-    Serial.println(F("date YYYY-MM-DD"));
-    Serial.println(F("clock"));
-    Serial.println(F("clock run"));
-    Serial.println(F("clock stop"));
-    Serial.println(F("clock 24h"));
-    Serial.println(F("clock 12h"));
-    Serial.println();
-    Serial.println(F("units metric"));
-    Serial.println(F("units imperial"));
-    Serial.println(F("temp c"));
-    Serial.println(F("temp f"));
-    Serial.println(F("dateformat <0-3>"));
-    Serial.println(F("language <0-255>"));
-    Serial.println(F("speed <0-325>"));
-    Serial.println(F("outside <-50..75>"));
-    Serial.println(F("fuel <0-125>"));
-    Serial.println(F("reverse on/off"));
-    Serial.println(F("handbrake on/off"));
-    Serial.println(F("park on/off"));
-    Serial.println(F("park system <0-7>"));
-    Serial.println(F("park display <0-3>"));
-    Serial.println(F("park trigger on/off"));
-    Serial.println();
-
-    Serial.println(F("mfsw volup"));
-    Serial.println(F("mfsw voldown"));
-    Serial.println(F("mfsw next"));
-    Serial.println(F("mfsw previous"));
-    Serial.println(F("mfsw phone"));
-    Serial.println(F("mfsw voice"));
-    Serial.println(F("mfsw left"));
-    Serial.println(F("mfsw right"));
-    Serial.println(F("mfsw up"));
-    Serial.println(F("mfsw down"));
-    Serial.println(F("mfsw ok"));
-    Serial.println(F("mfsw idle"));
-    Serial.println(F("mfsw release"));
-    Serial.println(F("mfsw"));
-    Serial.println();
-
-    Serial.println(F("state"));
-    Serial.println(F("messages"));
-    Serial.println(F("mark"));
-    Serial.println();
-
-    Serial.println(F("feedback"));
-    Serial.println(F("feedback on"));
-    Serial.println(F("feedback off"));
-    Serial.println(F("ascii on"));
-    Serial.println(F("ascii off"));
-    Serial.println(F("media"));
-    Serial.println(F("media on"));
-    Serial.println(F("media off"));
-    Serial.println();
-
-    Serial.println(F("monitor all"));
-    Serial.println(F("monitor rx"));
-    Serial.println(F("monitor tx"));
-    Serial.println(F("monitor diag"));
-    Serial.println(F("monitor off"));
-    Serial.println();
-
-    Serial.println(F("help"));
+    Serial.println(F("MQB Emulator ESP32-S3 v1.1.5 Simulate Gateway"));
+    Serial.println(F("simulategateway on/off | simulategateway"));
+    Serial.println(F("on/off | engine on/off | rpm <n>"));
+    Serial.println(F("lights on/off | dimming <0-100>"));
+    Serial.println(F("speed/outside/fuel | handbrake/reverse on/off"));
+    Serial.println(F("mfsw volup/voldown/next/previous"));
+    Serial.println(F("mfsw phone/voice/left/right/up/down/ok"));
+    Serial.println(F("feedback | ascii on/off | media on/off"));
+    Serial.println(F("abslamp/esplamp/mil/oilwarn on/off"));
+    Serial.println(F("enginewarn/airbaglamp/steeringlamp on/off"));
+    Serial.println(F("statuswatch on/off | bcprov on/off"));
+    Serial.println(F("diagspoof on/off | diagspoof  (VCDS F197 bench test)"));
+    Serial.println(F("bctrip on/off | bctrip <km>  (Function 0x39 test)"));
+    Serial.println(F("monitor all/rx/tx/diag/off"));
+    Serial.println(F("canstats"));
+    Serial.println(F("state | messages | mark | help"));
     Serial.println();
 }

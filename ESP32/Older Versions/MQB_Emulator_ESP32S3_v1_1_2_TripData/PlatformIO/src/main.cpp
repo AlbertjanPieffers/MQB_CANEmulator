@@ -1,37 +1,166 @@
-#include <SPI.h>
-#include <mcp_can.h>
+#include <Arduino.h>
+#include "driver/twai.h"
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <ArduinoOTA.h>
+
+#include <stdarg.h>
+
+// ============================================================
+// NON-BLOCKING DEBUG SERIAL
+// ============================================================
+//
+// ESP32-S3 native USB serial can stop draining when the host closes the
+// Serial Monitor. Direct Serial.print()/println() calls can then stall the
+// main loop, which also stalls CAN, Wi-Fi and the Web UI.
+//
+// All debug output in this project goes through DebugSerial. It derives from
+// Print, but its byte writer only writes while the underlying Serial port has
+// TX space. If no host is listening, output is silently dropped. Serial input
+// is still passed through normally.
+//
+// Serial is therefore optional: CAN/Wi-Fi/Web UI must continue to operate
+// with the USB cable disconnected or the Serial Monitor closed.
+//
+class NonBlockingDebugSerial : public Print
+{
+public:
+    void begin(unsigned long baud)
+    {
+        Serial.begin(baud);
+    }
+
+    int available()
+    {
+        return Serial.available();
+    }
+
+    int read()
+    {
+        return Serial.read();
+    }
+
+    using Print::write;
+
+    size_t write(uint8_t value) override
+    {
+        // Never wait for USB CDC / serial TX space.
+        if (Serial.availableForWrite() <= 0)
+        {
+            return 0;
+        }
+
+        return Serial.write(value);
+    }
+
+    size_t printf(const char *format, ...)
+    {
+        if (Serial.availableForWrite() <= 0)
+        {
+            return 0;
+        }
+
+        char buffer[256];
+
+        va_list args;
+        va_start(args, format);
+        int required = vsnprintf(buffer, sizeof(buffer), format, args);
+        va_end(args);
+
+        if (required <= 0)
+        {
+            return 0;
+        }
+
+        size_t length = (size_t)required;
+        if (length >= sizeof(buffer))
+        {
+            length = sizeof(buffer) - 1;
+        }
+
+        // Print::write() ultimately calls the non-blocking byte writer above.
+        return Print::write((const uint8_t *)buffer, length);
+    }
+};
+
+NonBlockingDebugSerial DebugSerial;
+
 
 /*
- * MQB CAN Bench Simulator v6.4.5 MFSW + media metadata
+ * MQB CAN Emulator v1.1.2
+ * ESP32-S3 + external CAN transceiver (e.g. SN65HVD230)
  *
- * Hardware:
- *   Arduino + MCP2515
+ * This is a single-bus MQB Infotainment CAN emulator.
+ * There is NO PQ bus and NO PQ<->MQB translation layer in this version.
  *
  * CAN:
  *   500 kbit/s
- *   MCP2515 oscillator: 16 MHz
- *   CS pin: 10
+ *   Classic CAN / CAN 2.0
+ *   ESP32-S3 internal TWAI controller
  *
- * Periodic messages:
- *   0x3C0 Klemmen_Status_01
- *   0x3BE Motor_14
- *   0x5F0 Dimmung_01
- *   0x6B2 Diagnose_01
- *   0x643 Einheiten_01
+ * Default pins:
+ *   TWAI TX -> GPIO 17
+ *   TWAI RX -> GPIO 18
  *
- * MFSW Infotainment CAN:
- *   Golf Mk7 capture format, CAN ID 0x5BF, DLC 4
+ * Change CAN_TX_PIN / CAN_RX_PIN below to match your wiring.
  *
- * Serial:
- *   115200 baud
+ * Existing MQB emulator functions are ported from the Uno project,
+ * including MFSW, vehicle state, media/phone feedback decoding,
+ * status watch and the experimental Bordcomputer LSG 0x0F probe.
+ *
+ * Network:
+ *   Wi-Fi station mode if credentials are configured.
+ *   Fallback access point otherwise.
+ *
+ * OTA:
+ *   ArduinoOTA
+ *   Browser firmware upload at /update
+ *
+ * Web UI:
+ *   Dashboard and controls at /
+ *   JSON state at /api/state
+ *   Existing serial commands via /api/command?cmd=...
  */
 
-#define CAN_CS_PIN 10
+// ============================================================
+// ESP32-S3 TWAI PIN CONFIGURATION
+// ============================================================
 
-MCP_CAN CAN(CAN_CS_PIN);
+static constexpr gpio_num_t CAN_TX_PIN = GPIO_NUM_17;
+static constexpr gpio_num_t CAN_RX_PIN = GPIO_NUM_18;
 
-const byte CAN_SPEED = CAN_500KBPS;
-const byte CAN_CLOCK = MCP_16MHZ;
+// ============================================================
+// NETWORK / OTA SETTINGS
+// ============================================================
+
+// Leave empty to start the fallback access point immediately.
+static const char *WIFI_SSID = "";
+static const char *WIFI_PASSWORD = "";
+
+static const char *AP_SSID = "MQB-Emulator";
+static const char *AP_PASSWORD = "change-me-123";
+
+static const char *OTA_HOSTNAME = "mqb-emulator";
+static const char *OTA_PASSWORD = "change-me-ota";
+
+// ============================================================
+// CAN / WEB STATE
+// ============================================================
+
+bool canReady = false;
+
+uint32_t canRxCount = 0;
+uint32_t canTxCount = 0;
+uint32_t canTxErrorCount = 0;
+
+WebServer webServer(80);
+bool webReady = false;
+bool otaReady = false;
+
+String networkMode = "OFF";
+IPAddress networkIp;
 
 
 // ============================================================
@@ -182,24 +311,6 @@ BenchVehicleData benchData =
 };
 
 byte kombi01Counter = 0;
-byte rearLightCounter = 0;
-
-// Parkhilfe_01 (0x497) experimental state.
-struct ParkhilfeState
-{
-    bool enabled;
-    bool opticalFront;
-    bool opticalRear;
-    bool obstacleFront;
-    bool obstacleRear;
-    bool triggerDisplay;
-    byte systemState;
-    byte displayRequest;
-};
-
-ParkhilfeState parkhilfe = { false, true, true, true, true, true, 1, 1 };
-
-
 // ============================================================
 // EXTENDED DBC VEHICLE DATA - LOW SRAM
 // ============================================================
@@ -336,10 +447,32 @@ byte asciiPrintedLength = 0;
 // For this capture that maps cleanly to Title / Artist / Album.
 bool mediaMetadataEnabled = true;
 bool mediaMessageActive = false;
-byte mediaBuffer[96];
+byte mediaBuffer[56];
 byte mediaBufferLength = 0;
 byte mediaExpectedSequence = 0;
 unsigned long mediaLastFrameMs = 0;
+
+// Vehicle-status discovery window.
+// A warning/status command can arm a short capture window so only the
+// interesting Infotainment/BAP traffic after that change is printed.
+bool vehicleStatusProbeEnabled = true;
+bool vehicleStatusProbeActive = false;
+unsigned long vehicleStatusProbeUntil = 0;
+const unsigned long VEHICLE_STATUS_PROBE_MS = 3000UL;
+
+// Minimal experimental LSG 0x0F Bordcomputer provider probe.
+bool bcProviderEnabled = false;
+
+// Bordcomputer / trip-data laboratory.
+// Function 0x39 is a strong capture-derived candidate for trip distance.
+bool bcTripTestEnabled = false;
+float bcTripDistanceKm = 123.40f;
+unsigned long bcTripLastSend = 0;
+static const unsigned long BC_TRIP_INTERVAL_MS = 1000UL;
+
+// Suppress repeated identical ACK lines.
+bool volumeAckKnown = false;
+byte lastVolumeAck = 0;
 
 void decodeInfotainmentFeedback(
     unsigned long id,
@@ -357,6 +490,17 @@ void resetMediaMetadata();
 void appendMediaBytes(const byte *data, byte startIndex, byte dlc);
 void tryPrintMediaMetadata();
 void printMediaField(const __FlashStringHelper *label, const byte *data, byte len);
+
+const __FlashStringHelper *mfswButtonName(byte code);
+void armVehicleStatusProbe(const __FlashStringHelper *reason);
+void decodeVehicleStatusProbe(unsigned long id, byte dlc, const byte *data);
+void processBcProvider(unsigned long id, bool extended, byte dlc, const byte *data);
+void printCompactExtFrame(
+    const __FlashStringHelper *prefix,
+    unsigned long id,
+    byte dlc,
+    const byte *data
+);
 
 
 // ============================================================
@@ -424,12 +568,10 @@ void updateEinheiten01(CanMessage &message);
 void updateBCM01(CanMessage &message);
 void updateKombi01(CanMessage &message);
 void updateKombi02(CanMessage &message);
-void updateRearLight01(CanMessage &message);
-void updateParkhilfe01(CanMessage &message);
 
 void sendMessages();
 bool sendCanMessage(CanMessage &message);
-bool sendRawCan(unsigned long id, bool extended, byte dlc, byte *data);
+bool sendRawCan(unsigned long id, bool extended, byte dlc, const byte *data);
 
 void updateClock();
 void incrementClockOneSecond();
@@ -549,38 +691,520 @@ CanMessage messages[] =
         true,
         {0, 0, 0, 0, 0, 0, 0, 0},
         updateKombi02
-    },
-
-    // DBC-confirmed: Licht_hinten_01, decimal 982 = 0x3D6.
-    // Includes reverse-light-active state.
-    {
-        "Licht_hinten_01",
-        0x3D6,
-        false,
-        8,
-        100,
-        0,
-        true,
-        {0, 0, 0, 0, 0, 0, 0, 0},
-        updateRearLight01
-    }
-,
-
-    // DBC-confirmed: Parkhilfe_01, decimal 1175 = 0x497.
-    {
-        "Parkhilfe_01",
-        0x497,
-        false,
-        8,
-        100,
-        0,
-        false,
-        {0, 0, 0, 0, 0, 0, 0, 0},
-        updateParkhilfe01
     }
 };
 
 const byte MESSAGE_COUNT = sizeof(messages) / sizeof(messages[0]);
+
+
+
+// ============================================================
+// FORWARD DECLARATIONS
+// ============================================================
+//
+// Arduino normally generates function prototypes for .ino files, but the
+// combination of lambdas used by WebServer and functions declared later in
+// the sketch can prevent the generated prototypes from being sufficient.
+// Keep these explicit declarations so the ESP32-S3 build is deterministic.
+//
+
+void setBitsIntel(byte *data, byte startBit, byte length, uint32_t value);
+
+void setIgnitionOn();
+void setIgnitionOff();
+
+void monitorCan();
+
+bool shouldPrintRxFrame(unsigned long id, bool extended);
+void printCanFrame(
+    const char *direction,
+    unsigned long id,
+    bool extended,
+    byte dlc,
+    const byte *data
+);
+
+void processSerial();
+void processCommand(String command);
+
+bool parseOnOff(String value, bool &result);
+
+void printState();
+void printLighting();
+void printClock();
+void printMfsw();
+void printMessages();
+void printHelp();
+void sendBcConfig();
+void sendBcFunctionList();
+void sendBcHeartbeatConfig();
+void sendBcTripDistance();
+void updateBcTripData();
+
+// ============================================================
+// ESP32-S3 CAN / WIFI / WEB / OTA INFRASTRUCTURE
+// ============================================================
+
+void initCan();
+void initNetwork();
+void initWebUi();
+void initOta();
+
+String makeStateJson();
+
+void initCan()
+{
+    DebugSerial.print(F("Initializing TWAI 500 kbit/s... "));
+
+    twai_general_config_t general =
+        TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
+
+    general.tx_queue_len = 32;
+    general.rx_queue_len = 64;
+
+    twai_timing_config_t timing = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t filter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    esp_err_t result = twai_driver_install(&general, &timing, &filter);
+
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+    {
+        DebugSerial.print(F("install failed: "));
+        DebugSerial.println((int)result);
+        return;
+    }
+
+    result = twai_start();
+
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+    {
+        DebugSerial.print(F("start failed: "));
+        DebugSerial.println((int)result);
+        return;
+    }
+
+    canReady = true;
+    DebugSerial.println(F("OK"));
+
+    DebugSerial.print(F("TWAI TX GPIO: "));
+    DebugSerial.println((int)CAN_TX_PIN);
+    DebugSerial.print(F("TWAI RX GPIO: "));
+    DebugSerial.println((int)CAN_RX_PIN);
+    DebugSerial.println();
+}
+
+
+// ============================================================
+// NETWORK
+// ============================================================
+
+void initNetwork()
+{
+    WiFi.mode(WIFI_MODE_NULL);
+    delay(100);
+
+    bool connected = false;
+
+    if (strlen(WIFI_SSID) > 0)
+    {
+        DebugSerial.print(F("Connecting WiFi: "));
+        DebugSerial.println(WIFI_SSID);
+
+        WiFi.mode(WIFI_STA);
+        WiFi.setHostname(OTA_HOSTNAME);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+        unsigned long start = millis();
+
+        while (WiFi.status() != WL_CONNECTED && (millis() - start) < 12000UL)
+        {
+            delay(250);
+            DebugSerial.print('.');
+        }
+
+        DebugSerial.println();
+
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            connected = true;
+            networkMode = "STA";
+            networkIp = WiFi.localIP();
+
+            DebugSerial.print(F("WiFi connected: "));
+            DebugSerial.println(networkIp);
+        }
+    }
+
+    if (!connected)
+    {
+        DebugSerial.println(F("Starting fallback access point..."));
+
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+        networkMode = "AP";
+        networkIp = WiFi.softAPIP();
+
+        DebugSerial.print(F("AP SSID: "));
+        DebugSerial.println(AP_SSID);
+        DebugSerial.print(F("AP IP  : "));
+        DebugSerial.println(networkIp);
+    }
+}
+
+
+// ============================================================
+// WEB UI
+// ============================================================
+
+static const char WEB_PAGE[] PROGMEM = R"HTML(
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MQB CAN Emulator</title>
+<style>
+body{font-family:system-ui,Arial,sans-serif;margin:0;background:#111827;color:#e5e7eb}
+main{max-width:1050px;margin:auto;padding:18px}
+h1{font-size:24px;margin:0 0 6px}
+small{color:#9ca3af}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-top:16px}
+.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:14px}
+.row{display:flex;justify-content:space-between;gap:10px;margin:7px 0}
+button{border:0;border-radius:8px;padding:9px 12px;margin:4px;background:#374151;color:#fff;cursor:pointer}
+button:hover{background:#4b5563}
+input{background:#111827;color:#fff;border:1px solid #4b5563;border-radius:7px;padding:8px}
+pre{white-space:pre-wrap;word-break:break-word;background:#0b1220;padding:10px;border-radius:8px}
+a{color:#93c5fd}
+</style>
+</head>
+<body>
+<main>
+<h1>MQB CAN Emulator</h1>
+<small>ESP32-S3 · internal TWAI · Infotainment CAN</small>
+
+<div class="grid">
+<div class="card">
+<h3>Vehicle</h3>
+<div class="row"><span>Terminal 15</span><b id="t15">-</b></div>
+<div class="row"><span>Engine</span><b id="eng">-</b></div>
+<div class="row"><span>RPM</span><b id="rpm">-</b></div>
+<div class="row"><span>Speed</span><b id="speed">-</b></div>
+<div class="row"><span>Reverse</span><b id="rev">-</b></div>
+<div class="row"><span>Handbrake</span><b id="hb">-</b></div>
+<button onclick="cmd('on')">Ignition ON</button>
+<button onclick="cmd('off')">Ignition OFF</button>
+<button onclick="cmd('engine on')">Engine ON</button>
+<button onclick="cmd('engine off')">Engine OFF</button>
+</div>
+
+<div class="card">
+<h3>CAN</h3>
+<div class="row"><span>Ready</span><b id="canready">-</b></div>
+<div class="row"><span>RX</span><b id="rx">-</b></div>
+<div class="row"><span>TX</span><b id="tx">-</b></div>
+<div class="row"><span>TX errors</span><b id="txe">-</b></div>
+</div>
+
+<div class="card">
+<h3>MFSW</h3>
+<button onclick="cmd('mfsw volup')">Volume +</button>
+<button onclick="cmd('mfsw voldown')">Volume -</button>
+<button onclick="cmd('mfsw previous')">Previous</button>
+<button onclick="cmd('mfsw next')">Next</button>
+<button onclick="cmd('mfsw phone')">Phone</button>
+<button onclick="cmd('mfsw voice')">Voice</button>
+<button onclick="cmd('mfsw left')">Left</button>
+<button onclick="cmd('mfsw right')">Right</button>
+<button onclick="cmd('mfsw up')">Up</button>
+<button onclick="cmd('mfsw down')">Down</button>
+<button onclick="cmd('mfsw ok')">OK</button>
+</div>
+
+<div class="card">
+<h3>Bench functions</h3>
+<button onclick="cmd('lights on')">Lights ON</button>
+<button onclick="cmd('lights off')">Lights OFF</button>
+<button onclick="cmd('reverse on')">Reverse ON</button>
+<button onclick="cmd('reverse off')">Reverse OFF</button>
+<button onclick="cmd('handbrake on')">Handbrake ON</button>
+<button onclick="cmd('handbrake off')">Handbrake OFF</button>
+<button onclick="cmd('bcprov on')">BC provider ON</button>
+<button onclick="cmd('bcprov off')">BC provider OFF</button>
+</div>
+
+<div class="card">
+<h3>Trip data lab</h3>
+<div class="row"><span>Candidate</span><b>BC Function 0x39</b></div>
+<div class="row"><span>Hypothesis</span><b>Trip distance</b></div>
+<input id="tripkm" type="number" step="0.01" value="123.40" style="width:45%">
+<button onclick="sendTrip()">Send km</button>
+<button onclick="cmd('bctrip on')">Periodic ON</button>
+<button onclick="cmd('bctrip off')">Periodic OFF</button>
+<p><small>Capture-derived test: Status 43 F9 + uint24 LE at 0.01 km + 01.</small></p>
+</div>
+
+<div class="card">
+<h3>Raw command</h3>
+<input id="raw" style="width:70%" placeholder="e.g. rpm 1200">
+<button onclick="sendRaw()">Send</button>
+<pre id="result">Ready</pre>
+</div>
+
+<div class="card">
+<h3>Firmware</h3>
+<div class="row"><span>Network</span><b id="net">-</b></div>
+<div class="row"><span>IP</span><b id="ip">-</b></div>
+<p><a href="/update">Open firmware update page</a></p>
+<p><small>ArduinoOTA is also active.</small></p>
+</div>
+</div>
+</main>
+
+<script>
+async function cmd(c){
+  const r=await fetch('/api/command?cmd='+encodeURIComponent(c));
+  result.textContent=await r.text();
+  setTimeout(refresh,120);
+}
+function sendRaw(){cmd(document.getElementById('raw').value)}
+function sendTrip(){cmd('bctrip '+document.getElementById('tripkm').value)}
+async function refresh(){
+  try{
+    const s=await (await fetch('/api/state')).json();
+    const yn=v=>v?'ON':'OFF';
+    t15.textContent=yn(s.terminal15);
+    eng.textContent=yn(s.engineRunning);
+    rpm.textContent=s.rpm;
+    speed.textContent=s.speedKph.toFixed(1)+' km/h';
+    rev.textContent=yn(s.reverse);
+    hb.textContent=yn(s.handbrake);
+    canready.textContent=yn(s.canReady);
+    rx.textContent=s.canRx;
+    tx.textContent=s.canTx;
+    txe.textContent=s.canTxErrors;
+    net.textContent=s.networkMode;
+    ip.textContent=s.ip;
+  }catch(e){}
+}
+setInterval(refresh,1000); refresh();
+</script>
+</body>
+</html>
+)HTML";
+
+String makeStateJson()
+{
+    String json;
+    json.reserve(420);
+
+    json += '{';
+
+    json += F("\"terminal15\":");
+    json += vehicle.terminal15 ? F("true") : F("false");
+
+    json += F(",\"engineRunning\":");
+    json += vehicle.engineRunning ? F("true") : F("false");
+
+    json += F(",\"rpm\":");
+    json += vehicle.engineRpm;
+
+    json += F(",\"speedKph\":");
+    json += String(benchData.speedKph, 1);
+
+    json += F(",\"reverse\":");
+    json += benchData.reverse ? F("true") : F("false");
+
+    json += F(",\"handbrake\":");
+    json += benchData.parkingBrake ? F("true") : F("false");
+
+    json += F(",\"canReady\":");
+    json += canReady ? F("true") : F("false");
+
+    json += F(",\"canRx\":");
+    json += canRxCount;
+
+    json += F(",\"canTx\":");
+    json += canTxCount;
+
+    json += F(",\"canTxErrors\":");
+    json += canTxErrorCount;
+
+    json += F(",\"networkMode\":\"");
+    json += networkMode;
+    json += '"';
+
+    json += F(",\"ip\":\"");
+    json += networkIp.toString();
+    json += '"';
+
+    json += '}';
+    return json;
+}
+
+void initWebUi()
+{
+    if (WiFi.getMode() == WIFI_MODE_NULL)
+    {
+        return;
+    }
+
+    webServer.on("/", HTTP_GET, []()
+    {
+        webServer.send_P(200, "text/html", WEB_PAGE);
+    });
+
+    webServer.on("/api/state", HTTP_GET, []()
+    {
+        webServer.send(200, "application/json", makeStateJson());
+    });
+
+    webServer.on("/api/command", HTTP_GET, []()
+    {
+        if (!webServer.hasArg("cmd"))
+        {
+            webServer.send(400, "text/plain", "Missing cmd");
+            return;
+        }
+
+        String command = webServer.arg("cmd");
+        command.trim();
+
+        if (command.length() == 0)
+        {
+            webServer.send(400, "text/plain", "Empty command");
+            return;
+        }
+
+        processCommand(command);
+
+        webServer.send(
+            200,
+            "text/plain",
+            String("Command accepted: ") + command
+        );
+    });
+
+    webServer.on("/update", HTTP_GET, []()
+    {
+        static const char UPDATE_PAGE[] PROGMEM = R"UPD(
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Firmware Update</title></head>
+<body style="font-family:system-ui;max-width:700px;margin:40px auto;padding:0 15px">
+<h2>MQB Emulator firmware update</h2>
+<p>Select a compiled ESP32-S3 firmware <code>.bin</code>.</p>
+<form method="POST" action="/update" enctype="multipart/form-data">
+<input type="file" name="update" accept=".bin" required>
+<input type="submit" value="Upload firmware">
+</form>
+<p><a href="/">Back</a></p>
+</body></html>
+)UPD";
+
+        webServer.send_P(200, "text/html", UPDATE_PAGE);
+    });
+
+    webServer.on(
+        "/update",
+        HTTP_POST,
+        []()
+        {
+            bool ok = !Update.hasError();
+
+            webServer.send(
+                ok ? 200 : 500,
+                "text/plain",
+                ok ? "Update complete. Rebooting..." : "Update failed."
+            );
+
+            if (ok)
+            {
+                delay(500);
+                ESP.restart();
+            }
+        },
+        []()
+        {
+            HTTPUpload &upload = webServer.upload();
+
+            if (upload.status == UPLOAD_FILE_START)
+            {
+                DebugSerial.printf("Web OTA start: %s\n", upload.filename.c_str());
+
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN))
+                {
+                    Update.printError(Serial);
+                }
+            }
+            else if (upload.status == UPLOAD_FILE_WRITE)
+            {
+                if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
+                {
+                    Update.printError(Serial);
+                }
+            }
+            else if (upload.status == UPLOAD_FILE_END)
+            {
+                if (Update.end(true))
+                {
+                    DebugSerial.printf("Web OTA complete: %u bytes\n", upload.totalSize);
+                }
+                else
+                {
+                    Update.printError(Serial);
+                }
+            }
+        }
+    );
+
+    webServer.onNotFound([]()
+    {
+        webServer.send(404, "text/plain", "Not found");
+    });
+
+    webServer.begin();
+    webReady = true;
+
+    DebugSerial.println(F("Web UI started"));
+}
+
+
+// ============================================================
+// ARDUINO OTA
+// ============================================================
+
+void initOta()
+{
+    if (WiFi.getMode() == WIFI_MODE_NULL)
+    {
+        return;
+    }
+
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+
+    ArduinoOTA.onStart([]()
+    {
+        DebugSerial.println(F("ArduinoOTA start"));
+    });
+
+    ArduinoOTA.onEnd([]()
+    {
+        DebugSerial.println(F("ArduinoOTA complete"));
+    });
+
+    ArduinoOTA.onError([](ota_error_t error)
+    {
+        DebugSerial.print(F("ArduinoOTA error: "));
+        DebugSerial.println((unsigned int)error);
+    });
+
+    ArduinoOTA.begin();
+    otaReady = true;
+
+    DebugSerial.println(F("ArduinoOTA started"));
+}
 
 
 // ============================================================
@@ -589,48 +1213,29 @@ const byte MESSAGE_COUNT = sizeof(messages) / sizeof(messages[0]);
 
 void setup()
 {
-    Serial.begin(115200);
+    DebugSerial.begin(115200);
     delay(500);
 
-    Serial.println();
-    Serial.println(F("======================================"));
-    Serial.println(F("MQB CAN Bench Simulator v6.4.5 MFSW + media metadata"));
-    Serial.println(F("======================================"));
-    Serial.println();
+    DebugSerial.println();
+    DebugSerial.println(F("======================================"));
+    DebugSerial.println(F("MQB CAN Emulator v1.1.2"));
+    DebugSerial.println(F("ESP32-S3 / internal TWAI"));
+    DebugSerial.println(F("======================================"));
+    DebugSerial.println();
 
-    Serial.print(F("Initializing MCP2515... "));
-
-    byte result = CAN.begin(MCP_ANY, CAN_SPEED, CAN_CLOCK);
-
-    if (result != CAN_OK)
-    {
-        Serial.println(F("FAILED"));
-
-        while (true)
-        {
-            delay(1000);
-        }
-    }
-
-    Serial.println(F("OK"));
-
-    CAN.setMode(MCP_NORMAL);
-
-    Serial.println(F("CAN mode : NORMAL"));
-    Serial.println(F("CAN speed: 500 kbit/s"));
-    Serial.println(F("CAN clock: 16 MHz"));
-    Serial.println();
+    initCan();
+    initNetwork();
+    initWebUi();
+    initOta();
 
     unsigned long now = millis();
 
-    // Stagger startup traffic. The previous code made every periodic frame
-    // immediately due, which filled all MCP2515 TX buffers at once.
+    // Stagger startup traffic.
     for (byte i = 0; i < MESSAGE_COUNT; i++)
     {
         messages[i].lastSend = now + ((unsigned long)i * 3UL);
     }
 
-    // Stagger the four lightweight DBC motor frames as well.
     lastMotor04 = now + 7UL;
     lastMotor07 = now + 17UL;
     lastMotor20 = now + 27UL;
@@ -641,21 +1246,40 @@ void setup()
 
     printState();
     printHelp();
+
+    DebugSerial.println();
+
+    if (webReady)
+    {
+        DebugSerial.print(F("Web UI: http://"));
+        DebugSerial.print(networkIp);
+        DebugSerial.println(F("/"));
+    }
 }
-
-
-// ============================================================
-// MAIN LOOP
-// ============================================================
 
 void loop()
 {
     updateClock();
     updateMfsw();
+
     sendMessages();
     sendExtendedVehicleMessages();
+    updateBcTripData();
+
     monitorCan();
     processSerial();
+
+    if (webReady)
+    {
+        webServer.handleClient();
+    }
+
+    if (otaReady)
+    {
+        ArduinoOTA.handle();
+    }
+
+    delay(1);
 }
 
 
@@ -725,26 +1349,36 @@ bool sendCanMessage(CanMessage &message)
     return sendRawCan(message.id, message.extended, message.dlc, message.data);
 }
 
-bool sendRawCan(unsigned long id, bool extended, byte dlc, byte *data)
+bool sendRawCan(unsigned long id, bool extended, byte dlc, const byte *data)
 {
-    // MCP2515 has only three hardware TX buffers. Several simulator frames can
-    // become due in the same loop iteration, so briefly wait/retry when all
-    // buffers are occupied instead of immediately dropping the frame.
-    byte status = CAN_FAILTX;
-
-    for (byte attempt = 0; attempt < 4; attempt++)
+    if (!canReady || dlc > 8)
     {
-        status = CAN.sendMsgBuf(id, extended ? 1 : 0, dlc, data);
-        if (status == CAN_OK) break;
-        delayMicroseconds(350);
-    }
-
-    if (status != CAN_OK)
-    {
-        Serial.print(F("CAN TX ERROR: 0x"));
-        Serial.println(id, HEX);
         return false;
     }
+
+    twai_message_t message = {};
+    message.identifier = id & 0x1FFFFFFFUL;
+    message.extd = extended ? 1 : 0;
+    message.rtr = 0;
+    message.data_length_code = dlc;
+
+    for (byte i = 0; i < dlc; i++)
+    {
+        message.data[i] = data[i];
+    }
+
+    esp_err_t result = twai_transmit(&message, pdMS_TO_TICKS(5));
+
+    if (result != ESP_OK)
+    {
+        canTxErrorCount++;
+
+        DebugSerial.print(F("CAN TX ERROR: 0x"));
+        DebugSerial.println(id, HEX);
+        return false;
+    }
+
+    canTxCount++;
 
     if (monitorMode == MONITOR_ALL || monitorMode == MONITOR_TX)
     {
@@ -1060,48 +1694,6 @@ void updateKombi02(CanMessage &message)
 
 
 // ============================================================
-// LICHT_HINTEN_01 - 0x3D6
-// ============================================================
-
-void updateRearLight01(CanMessage &message)
-{
-    for (byte i = 0; i < 8; i++)
-    {
-        message.data[i] = 0x00;
-    }
-
-    // Licht_hinten_01_BZ, bits 0..3.
-    setBitsIntel(message.data, 0, 4, rearLightCounter & 0x0F);
-
-    // LH_Rueckfahrlicht_aktiv, bit 13.
-    setBitsIntel(message.data, 13, 1, benchData.reverse ? 1 : 0);
-
-    rearLightCounter = (rearLightCounter + 1) & 0x0F;
-}
-
-
-// ============================================================
-// PARKHILFE_01 - 0x497
-// ============================================================
-
-void updateParkhilfe01(CanMessage &message)
-{
-    for (byte i = 0; i < 8; i++) message.data[i] = 0x00;
-
-    if (!parkhilfe.enabled) return;
-
-    // DBC signal positions from Parkhilfe_01.
-    setBitsIntel(message.data, 16, 1, parkhilfe.opticalFront ? 1 : 0);
-    setBitsIntel(message.data, 17, 1, parkhilfe.opticalRear ? 1 : 0);
-    setBitsIntel(message.data, 18, 1, parkhilfe.obstacleFront ? 1 : 0);
-    setBitsIntel(message.data, 19, 1, parkhilfe.obstacleRear ? 1 : 0);
-    setBitsIntel(message.data, 48, 1, parkhilfe.triggerDisplay ? 1 : 0);
-    setBitsIntel(message.data, 58, 3, parkhilfe.systemState & 0x07);
-    setBitsIntel(message.data, 61, 2, parkhilfe.displayRequest & 0x03);
-}
-
-
-// ============================================================
 // EXTENDED DBC MESSAGES
 // ============================================================
 
@@ -1287,9 +1879,12 @@ void startMfswEvent(byte buttonCode)
     sendMfswPressed(buttonCode);
     mfswLastSend = now;
 
-    Serial.print(F("MFSW 0x5BF press: code=0x"));
-    if (buttonCode < 0x10) Serial.print('0');
-    Serial.println(buttonCode, HEX);
+    DebugSerial.print(F("[MFSW] "));
+    DebugSerial.print(mfswButtonName(buttonCode));
+    DebugSerial.print(F(" (0x"));
+    if (buttonCode < 0x10) DebugSerial.print('0');
+    DebugSerial.print(buttonCode, HEX);
+    DebugSerial.println(')');
 }
 
 void updateMfsw()
@@ -1357,10 +1952,10 @@ void setIgnitionOn()
     vehicle.terminal50 = false;
     vehicle.terminal75 = true;
 
-    Serial.println();
-    Serial.println(F("======================================"));
-    Serial.println(F("IGNITION ON"));
-    Serial.println(F("======================================"));
+    DebugSerial.println();
+    DebugSerial.println(F("======================================"));
+    DebugSerial.println(F("IGNITION ON"));
+    DebugSerial.println(F("======================================"));
 
     printState();
 }
@@ -1378,10 +1973,10 @@ void setIgnitionOff()
     vehicle.startStopStatus = 0;
     vehicle.startStopDriverRequest = 0;
 
-    Serial.println();
-    Serial.println(F("======================================"));
-    Serial.println(F("IGNITION OFF"));
-    Serial.println(F("======================================"));
+    DebugSerial.println();
+    DebugSerial.println(F("======================================"));
+    DebugSerial.println(F("IGNITION OFF"));
+    DebugSerial.println(F("======================================"));
 
     printState();
 }
@@ -1393,32 +1988,40 @@ void setIgnitionOff()
 
 void monitorCan()
 {
-    while (CAN.checkReceive() == CAN_MSGAVAIL)
+    if (!canReady)
     {
-        unsigned long rawId = 0;
-        byte len = 0;
+        return;
+    }
+
+    twai_message_t rx = {};
+
+    while (twai_receive(&rx, 0) == ESP_OK)
+    {
+        canRxCount++;
+
+        bool extended = rx.extd != 0;
+        unsigned long id = rx.identifier & 0x1FFFFFFFUL;
+        byte len = rx.data_length_code;
+
+        if (len > 8)
+        {
+            len = 8;
+        }
+
         byte buffer[8] = {0};
 
-        byte result = CAN.readMsgBuf(&rawId, &len, buffer);
-
-        if (result != CAN_OK)
+        for (byte i = 0; i < len; i++)
         {
-            return;
+            buffer[i] = rx.data[i];
         }
 
-        bool extended = (rawId & 0x80000000UL) != 0;
-        unsigned long id = rawId & 0x1FFFFFFFUL;
-
-        // Decode useful infotainment feedback even when the raw CAN monitor
-        // itself is disabled. This keeps the serial output readable.
         decodeInfotainmentFeedback(id, extended, len, buffer);
+        processBcProvider(id, extended, len, buffer);
 
-        if (!shouldPrintRxFrame(id, extended))
+        if (shouldPrintRxFrame(id, extended))
         {
-            continue;
+            printCanFrame("RX", id, extended, len, buffer);
         }
-
-        printCanFrame("RX", id, extended, len, buffer);
     }
 }
 
@@ -1448,6 +2051,11 @@ void decodeInfotainmentFeedback(
     {
         decodeMediaMetadata(id, dlc, data);
     }
+
+    if (vehicleStatusProbeEnabled && vehicleStatusProbeActive)
+    {
+        decodeVehicleStatusProbe(id, dlc, data);
+    }
 }
 
 void decodeVolumeFeedback(byte dlc, const byte *data)
@@ -1469,28 +2077,17 @@ void decodeVolumeFeedback(byte dlc, const byte *data)
             volumeKnown = true;
             lastVolume = volume;
 
-            Serial.print(F("[VOLUME] current = "));
-            Serial.print(volume);
-            Serial.print(F(" (0x"));
-            if (volume < 0x10) Serial.print('0');
-            Serial.print(volume, HEX);
-            Serial.println(')');
+            DebugSerial.print(F("[AUDIO] Volume = "));
+            DebugSerial.println(volume);
             return;
         }
 
         if (volume != lastVolume)
         {
-            Serial.print(F("[VOLUME] "));
-            Serial.print(lastVolume);
-            Serial.print(F(" -> "));
-            Serial.print(volume);
-
-            if (data[0] == 0x4C)
-            {
-                Serial.print(F("  event"));
-            }
-
-            Serial.println();
+            DebugSerial.print(F("[AUDIO] Volume "));
+            DebugSerial.print(lastVolume);
+            DebugSerial.print(F(" -> "));
+            DebugSerial.println(volume);
             lastVolume = volume;
         }
 
@@ -1503,8 +2100,14 @@ void decodeVolumeFeedback(byte dlc, const byte *data)
     {
         byte volume = data[5];
 
-        Serial.print(F("[VOLUME ACK] "));
-        Serial.println(volume);
+        if (!volumeAckKnown || volume != lastVolumeAck)
+        {
+            volumeAckKnown = true;
+            lastVolumeAck = volume;
+
+            DebugSerial.print(F("[AUDIO] Volume ACK = "));
+            DebugSerial.println(volume);
+        }
     }
 }
 
@@ -1535,24 +2138,29 @@ void decodeAsciiTransport(unsigned long id, byte dlc, const byte *data)
         asciiExpectedLength = data[4];
         asciiPrintedLength = 0;
 
-        Serial.print(F("[ASCII 0x"));
-        Serial.print(id, HEX);
-        Serial.print(F(" ch=0x"));
-        if (data[2] < 0x10) Serial.print('0');
-        Serial.print(data[2], HEX);
-        Serial.print(F(" idx=0x"));
-        if (data[3] < 0x10) Serial.print('0');
-        Serial.print(data[3], HEX);
-        Serial.print(F(" len="));
-        Serial.print(asciiExpectedLength);
-        Serial.print(F("] \""));
+        if (id == 0x17332810UL)
+        {
+            DebugSerial.print(F("[PHONE/TEXT] \""));
+        }
+        else
+        {
+            DebugSerial.print(F("[TEXT 0x"));
+            DebugSerial.print(id, HEX);
+            DebugSerial.print(F(" ch=0x"));
+            if (data[2] < 0x10) DebugSerial.print('0');
+            DebugSerial.print(data[2], HEX);
+            DebugSerial.print(F(" idx=0x"));
+            if (data[3] < 0x10) DebugSerial.print('0');
+            DebugSerial.print(data[3], HEX);
+            DebugSerial.print(F("] \""));
+        }
 
         printAsciiPayload(data, 5, dlc);
 
         if (asciiExpectedLength > 0 &&
             asciiPrintedLength >= asciiExpectedLength)
         {
-            Serial.println('"');
+            DebugSerial.println('"');
             asciiMessageActive = false;
         }
 
@@ -1569,7 +2177,7 @@ void decodeAsciiTransport(unsigned long id, byte dlc, const byte *data)
         if (asciiExpectedLength > 0 &&
             asciiPrintedLength >= asciiExpectedLength)
         {
-            Serial.println('"');
+            DebugSerial.println('"');
             asciiMessageActive = false;
         }
 
@@ -1594,7 +2202,7 @@ void printAsciiPayload(const byte *data, byte startIndex, byte dlc)
         {
             if (asciiMessageActive)
             {
-                Serial.println('"');
+                DebugSerial.println('"');
                 asciiMessageActive = false;
             }
             return;
@@ -1602,12 +2210,12 @@ void printAsciiPayload(const byte *data, byte startIndex, byte dlc)
 
         if (value >= 0x20 && value <= 0x7E)
         {
-            Serial.write(value);
+            DebugSerial.write(value);
         }
         else
         {
             // Preserve the position without dumping binary control bytes.
-            Serial.print('.');
+            DebugSerial.print('.');
         }
 
         asciiPrintedLength++;
@@ -1702,8 +2310,8 @@ void printMediaField(
     byte len
 )
 {
-    Serial.print(label);
-    Serial.print(F(": "));
+    DebugSerial.print(label);
+    DebugSerial.print(F(": "));
 
     for (byte i = 0; i < len; i++)
     {
@@ -1711,15 +2319,15 @@ void printMediaField(
 
         if (value >= 0x20 && value <= 0x7E)
         {
-            Serial.write(value);
+            DebugSerial.write(value);
         }
         else
         {
-            Serial.print('.');
+            DebugSerial.print('.');
         }
     }
 
-    Serial.println();
+    DebugSerial.println();
 }
 
 void tryPrintMediaMetadata()
@@ -1831,14 +2439,247 @@ void tryPrintMediaMetadata()
         return;
     }
 
-    Serial.println();
-    Serial.println(F("[MEDIA UPDATE]"));
+    DebugSerial.println();
+    DebugSerial.println(F("[MEDIA UPDATE]"));
     printMediaField(F("Title "), &mediaBuffer[titlePos], titleLen);
     printMediaField(F("Artist"), &mediaBuffer[artistPos], artistLen);
     printMediaField(F("Album "), &mediaBuffer[albumPos], albumLen);
-    Serial.println();
+    DebugSerial.println();
 
     resetMediaMetadata();
+}
+
+
+
+const __FlashStringHelper *mfswButtonName(byte code)
+{
+    switch (code)
+    {
+        case MFSW_RIGHT_MENU:  return F("Right");
+        case MFSW_LEFT_MENU:   return F("Left");
+        case MFSW_UP:          return F("Up");
+        case MFSW_DOWN:        return F("Down");
+        case MFSW_OK:          return F("OK");
+        case MFSW_VOLUME_UP:   return F("Volume +");
+        case MFSW_VOLUME_DOWN: return F("Volume -");
+        case MFSW_NEXT:        return F("Next track");
+        case MFSW_PREVIOUS:    return F("Previous track");
+        case MFSW_VOICE:       return F("Voice");
+        case MFSW_PHONE:       return F("Phone");
+    }
+
+    return F("Unknown");
+}
+
+void printCompactExtFrame(
+    const __FlashStringHelper *prefix,
+    unsigned long id,
+    byte dlc,
+    const byte *data
+)
+{
+    DebugSerial.print(prefix);
+    DebugSerial.print(F(" 0x"));
+    DebugSerial.print(id, HEX);
+    DebugSerial.print(F("  "));
+
+    for (byte i = 0; i < dlc; i++)
+    {
+        if (data[i] < 0x10) DebugSerial.print('0');
+        DebugSerial.print(data[i], HEX);
+
+        if (i + 1 < dlc)
+        {
+            DebugSerial.print(' ');
+        }
+    }
+
+    DebugSerial.println();
+}
+
+void armVehicleStatusProbe(const __FlashStringHelper *reason)
+{
+    if (!vehicleStatusProbeEnabled)
+    {
+        return;
+    }
+
+    vehicleStatusProbeActive = true;
+    vehicleStatusProbeUntil = millis() + VEHICLE_STATUS_PROBE_MS;
+
+    DebugSerial.println();
+    DebugSerial.print(F("[STATUS PROBE] "));
+    DebugSerial.println(reason);
+}
+
+void decodeVehicleStatusProbe(unsigned long id, byte dlc, const byte *data)
+{
+    unsigned long now = millis();
+
+    if ((long)(now - vehicleStatusProbeUntil) >= 0)
+    {
+        vehicleStatusProbeActive = false;
+        DebugSerial.println(F("[STATUS PROBE] done"));
+        DebugSerial.println();
+        return;
+    }
+
+    if (dlc == 0)
+    {
+        return;
+    }
+
+    // Candidate status data is expected on the Infotainment extended family.
+    // Skip known audio/media/text channels so the probe stays useful.
+    if ((id & 0xFFFF0000UL) != 0x17330000UL)
+    {
+        return;
+    }
+
+    if (id == 0x17333110UL ||
+        id == 0x17333111UL ||
+        id == 0x17332810UL)
+    {
+        return;
+    }
+
+    byte type = data[0];
+
+    // Favor complete property/application frames and segmented-message starts.
+    // Continuation-only traffic is intentionally suppressed.
+    if (type == 0x30 ||
+        type == 0x38 ||
+        type == 0x39 ||
+        type == 0x3A ||
+        type == 0x3C ||
+        type == 0x3D ||
+        type == 0x4C ||
+        (type & 0xF0) == 0x80 ||
+        (type & 0xF0) == 0x90)
+    {
+        printCompactExtFrame(F("[STATUS]"), id, dlc, data);
+    }
+}
+
+
+
+void sendBcConfig()
+{
+    // Captured from a working MQB Bordcomputer provider on 0x17330F10.
+    const byte response[8] = {
+        0x33, 0xC2,
+        0x03, 0x00,
+        0x0F, 0x00,
+        0x06, 0x06
+    };
+
+    sendRawCan(0x17330F10UL, true, 8, response);
+    DebugSerial.println(F("[BC] BAP_Config 33 C2 03 00 0F 00 06 06"));
+}
+
+void sendBcFunctionList()
+{
+    // Working-capture FunctionList long message (Function 0x03).
+    const byte startFrame[8] = {0x80, 0x08, 0x33, 0xC3, 0x38, 0x07, 0xEF, 0xFD};
+    const byte continuation[5] = {0xC0, 0xFF, 0x00, 0x66, 0x00};
+
+    sendRawCan(0x17330F10UL, true, 8, startFrame);
+    delay(10);
+    sendRawCan(0x17330F10UL, true, 5, continuation);
+    DebugSerial.println(F("[BC] FunctionList sent"));
+}
+
+void sendBcHeartbeatConfig()
+{
+    const byte response[3] = {0x33, 0xC4, 0x0A};
+    sendRawCan(0x17330F10UL, true, 3, response);
+    DebugSerial.println(F("[BC] HeartbeatConfig 33 C4 0A"));
+}
+
+void sendBcTripDistance()
+{
+    // Capture-derived hypothesis:
+    // Function 0x39, Status (0x43), uint24 LE at 0.01 km, validity/status 0x01.
+    float km = bcTripDistanceKm;
+    if (km < 0.0f) km = 0.0f;
+    if (km > 167772.15f) km = 167772.15f;
+
+    uint32_t raw = (uint32_t)(km * 100.0f + 0.5f);
+    byte response[6] = {
+        0x43, 0xF9,
+        (byte)(raw & 0xFF),
+        (byte)((raw >> 8) & 0xFF),
+        (byte)((raw >> 16) & 0xFF),
+        0x01
+    };
+
+    sendRawCan(0x17330F10UL, true, 6, response);
+}
+
+void updateBcTripData()
+{
+    if (!bcProviderEnabled || !bcTripTestEnabled)
+    {
+        return;
+    }
+
+    unsigned long now = millis();
+    if ((unsigned long)(now - bcTripLastSend) < BC_TRIP_INTERVAL_MS)
+    {
+        return;
+    }
+
+    bcTripLastSend = now;
+    sendBcTripDistance();
+}
+
+void processBcProvider(
+    unsigned long id,
+    bool extended,
+    byte dlc,
+    const byte *data
+)
+{
+    if (!bcProviderEnabled ||
+        !extended ||
+        id != 0x17330F00UL ||
+        dlc < 2)
+    {
+        return;
+    }
+
+    DebugSerial.print(F("[BC RX] "));
+    if (data[0] < 0x10) DebugSerial.print('0');
+    DebugSerial.print(data[0], HEX);
+    DebugSerial.print(' ');
+    if (data[1] < 0x10) DebugSerial.print('0');
+    DebugSerial.println(data[1], HEX);
+
+    // Known BAP Get requests for LSG 0x0F standard functions.
+    if (data[0] == 0x13 && data[1] == 0xC2)
+    {
+        sendBcConfig();
+        return;
+    }
+
+    if (data[0] == 0x13 && data[1] == 0xC3)
+    {
+        sendBcFunctionList();
+        return;
+    }
+
+    if (data[0] == 0x13 && data[1] == 0xC4)
+    {
+        sendBcHeartbeatConfig();
+        return;
+    }
+
+    if (data[0] == 0x13 && data[1] == 0xF9)
+    {
+        sendBcTripDistance();
+        DebugSerial.println(F("[BC] Function 0x39 trip candidate reply"));
+        return;
+    }
 }
 
 
@@ -1869,47 +2710,47 @@ void printCanFrame(
     const byte *data
 )
 {
-    Serial.print(millis());
-    Serial.print(F(" ms  "));
-    Serial.print(direction);
-    Serial.print(F("  "));
+    DebugSerial.print(millis());
+    DebugSerial.print(F(" ms  "));
+    DebugSerial.print(direction);
+    DebugSerial.print(F("  "));
 
     if (extended)
     {
-        Serial.print(F("EXT  0x"));
+        DebugSerial.print(F("EXT  0x"));
     }
     else
     {
-        Serial.print(F("STD  0x"));
+        DebugSerial.print(F("STD  0x"));
     }
 
     if (!extended)
     {
-        if (id < 0x100) Serial.print('0');
-        if (id < 0x10)  Serial.print('0');
+        if (id < 0x100) DebugSerial.print('0');
+        if (id < 0x10)  DebugSerial.print('0');
     }
 
-    Serial.print(id, HEX);
-    Serial.print(F("  ["));
-    Serial.print(dlc);
-    Serial.print(F("]  "));
+    DebugSerial.print(id, HEX);
+    DebugSerial.print(F("  ["));
+    DebugSerial.print(dlc);
+    DebugSerial.print(F("]  "));
 
     for (byte i = 0; i < dlc; i++)
     {
         if (data[i] < 0x10)
         {
-            Serial.print('0');
+            DebugSerial.print('0');
         }
 
-        Serial.print(data[i], HEX);
+        DebugSerial.print(data[i], HEX);
 
         if (i < (dlc - 1))
         {
-            Serial.print(' ');
+            DebugSerial.print(' ');
         }
     }
 
-    Serial.println();
+    DebugSerial.println();
 }
 
 
@@ -1921,9 +2762,9 @@ String serialBuffer = "";
 
 void processSerial()
 {
-    while (Serial.available())
+    while (DebugSerial.available())
     {
-        char c = Serial.read();
+        char c = DebugSerial.read();
 
         if (c == '\r')
         {
@@ -1958,9 +2799,77 @@ void processCommand(String command)
     command.trim();
     command.toLowerCase();
 
+    if (command == "canstats")
+    {
+        DebugSerial.print(F("CAN RX/TX/ERR: "));
+        DebugSerial.print(canRxCount);
+        DebugSerial.print('/');
+        DebugSerial.print(canTxCount);
+        DebugSerial.print('/');
+        DebugSerial.println(canTxErrorCount);
+        return;
+    }
+
     if (command == "help")
     {
         printHelp();
+        return;
+    }
+
+    if (command == "bcprov on")
+    {
+        bcProviderEnabled = true;
+        DebugSerial.println(F("[BC] ON"));
+        return;
+    }
+
+    if (command == "bcprov off")
+    {
+        bcProviderEnabled = false;
+        DebugSerial.println(F("[BC] OFF"));
+        return;
+    }
+
+    if (command == "bctrip on")
+    {
+        bcProviderEnabled = true;
+        bcTripTestEnabled = true;
+        bcTripLastSend = 0;
+        sendBcConfig();
+        delay(10);
+        sendBcFunctionList();
+        delay(10);
+        sendBcHeartbeatConfig();
+        delay(10);
+        sendBcTripDistance();
+        DebugSerial.print(F("[BC] Trip test ON, candidate distance = "));
+        DebugSerial.print(bcTripDistanceKm, 2);
+        DebugSerial.println(F(" km"));
+        return;
+    }
+
+    if (command == "bctrip off")
+    {
+        bcTripTestEnabled = false;
+        DebugSerial.println(F("[BC] Trip test OFF"));
+        return;
+    }
+
+    if (command.startsWith("bctrip "))
+    {
+        float km = command.substring(7).toFloat();
+        if (km < 0.0f) km = 0.0f;
+        if (km > 167772.15f) km = 167772.15f;
+
+        bcTripDistanceKm = km;
+        bcProviderEnabled = true;
+        bcTripTestEnabled = true;
+        bcTripLastSend = 0;
+        sendBcTripDistance();
+
+        DebugSerial.print(F("[BC] Function 0x39 candidate distance = "));
+        DebugSerial.print(bcTripDistanceKm, 2);
+        DebugSerial.println(F(" km"));
         return;
     }
 
@@ -2020,7 +2929,7 @@ void processCommand(String command)
             vehicle.engineRpm = 850;
         }
 
-        Serial.println(F("Engine ON"));
+        DebugSerial.println(F("Engine ON"));
         printState();
         return;
     }
@@ -2030,7 +2939,7 @@ void processCommand(String command)
         vehicle.engineRunning = false;
         vehicle.engineRpm = 0;
 
-        Serial.println(F("Engine OFF"));
+        DebugSerial.println(F("Engine OFF"));
         printState();
         return;
     }
@@ -2044,7 +2953,7 @@ void processCommand(String command)
         vehicle.terminal75 = false;
         vehicle.engineRunning = false;
 
-        Serial.println(F("Starter ON"));
+        DebugSerial.println(F("Starter ON"));
         printState();
         return;
     }
@@ -2058,7 +2967,7 @@ void processCommand(String command)
             vehicle.terminal75 = true;
         }
 
-        Serial.println(F("Starter OFF"));
+        DebugSerial.println(F("Starter OFF"));
         printState();
         return;
     }
@@ -2073,8 +2982,8 @@ void processCommand(String command)
         vehicle.engineRpm = (uint16_t)rpm;
         vehicle.engineRunning = rpm > 0;
 
-        Serial.print(F("Engine RPM = "));
-        Serial.println(vehicle.engineRpm);
+        DebugSerial.print(F("Engine RPM = "));
+        DebugSerial.println(vehicle.engineRpm);
         return;
     }
 
@@ -2087,8 +2996,8 @@ void processCommand(String command)
 
         vehicle.startStopStatus = (byte)status;
 
-        Serial.print(F("Start/stop status = "));
-        Serial.println(vehicle.startStopStatus);
+        DebugSerial.print(F("Start/stop status = "));
+        DebugSerial.println(vehicle.startStopStatus);
         return;
     }
 
@@ -2099,7 +3008,7 @@ void processCommand(String command)
 
         if (secondSpace < 0)
         {
-            Serial.println(F("Usage: terminal <s|15|x|50|75> <on|off>"));
+            DebugSerial.println(F("Usage: terminal <s|15|x|50|75> <on|off>"));
             return;
         }
 
@@ -2109,7 +3018,7 @@ void processCommand(String command)
 
         if (!parseOnOff(value, state))
         {
-            Serial.println(F("Expected ON or OFF."));
+            DebugSerial.println(F("Expected ON or OFF."));
             return;
         }
 
@@ -2120,14 +3029,14 @@ void processCommand(String command)
         else if (terminalName == "75") vehicle.terminal75 = state;
         else
         {
-            Serial.println(F("Unknown terminal."));
+            DebugSerial.println(F("Unknown terminal."));
             return;
         }
 
-        Serial.print(F("Terminal "));
-        Serial.print(terminalName);
-        Serial.print(F(" = "));
-        Serial.println(state ? F("ON") : F("OFF"));
+        DebugSerial.print(F("Terminal "));
+        DebugSerial.print(terminalName);
+        DebugSerial.print(F(" = "));
+        DebugSerial.println(state ? F("ON") : F("OFF"));
         return;
     }
 
@@ -2149,7 +3058,7 @@ void processCommand(String command)
             lighting.dimming58xt = 100;
         }
 
-        Serial.println(F("Interior/display lighting ON"));
+        DebugSerial.println(F("Interior/display lighting ON"));
         return;
     }
 
@@ -2158,8 +3067,8 @@ void processCommand(String command)
         lighting.lightsEnabled = false;
         lighting.nightDesign = false;
 
-        Serial.println(F("Interior/display lighting OFF"));
-        Serial.println(F("Dimmung_01 now transmits 00 00 00 00 00 00 00 00"));
+        DebugSerial.println(F("Interior/display lighting OFF"));
+        DebugSerial.println(F("Dimmung_01 now transmits 00 00 00 00 00 00 00 00"));
         return;
     }
 
@@ -2179,10 +3088,10 @@ void processCommand(String command)
         // 58xd is raw 0..253. Scale user-friendly 0..100 to 0..253.
         lighting.dimming58xd = (byte)((value * 253L) / 100L);
 
-        Serial.print(F("Dimming = "));
-        Serial.print(value);
-        Serial.print(F("%, 58xd raw = "));
-        Serial.println(lighting.dimming58xd);
+        DebugSerial.print(F("Dimming = "));
+        DebugSerial.print(value);
+        DebugSerial.print(F("%, 58xd raw = "));
+        DebugSerial.println(lighting.dimming58xd);
         return;
     }
 
@@ -2192,14 +3101,14 @@ void processCommand(String command)
 
         if (!parseOnOff(command.substring(6), value))
         {
-            Serial.println(F("Usage: night on/off"));
+            DebugSerial.println(F("Usage: night on/off"));
             return;
         }
 
         lighting.nightDesign = value;
 
-        Serial.print(F("Night design = "));
-        Serial.println(value ? F("ON") : F("OFF"));
+        DebugSerial.print(F("Night design = "));
+        DebugSerial.println(value ? F("ON") : F("OFF"));
         return;
     }
 
@@ -2212,8 +3121,8 @@ void processCommand(String command)
 
         lighting.photoSensor = (uint16_t)value;
 
-        Serial.print(F("Photo sensor = "));
-        Serial.println(lighting.photoSensor);
+        DebugSerial.print(F("Photo sensor = "));
+        DebugSerial.println(lighting.photoSensor);
         return;
     }
 
@@ -2230,7 +3139,7 @@ void processCommand(String command)
 
         if (p1 < 0)
         {
-            Serial.println(F("Usage: time HH:MM[:SS]"));
+            DebugSerial.println(F("Usage: time HH:MM[:SS]"));
             return;
         }
 
@@ -2252,7 +3161,7 @@ void processCommand(String command)
             minute < 0 || minute > 59 ||
             second < 0 || second > 59)
         {
-            Serial.println(F("Invalid time."));
+            DebugSerial.println(F("Invalid time."));
             return;
         }
 
@@ -2273,7 +3182,7 @@ void processCommand(String command)
 
         if (p1 < 0 || p2 < 0)
         {
-            Serial.println(F("Usage: date YYYY-MM-DD"));
+            DebugSerial.println(F("Usage: date YYYY-MM-DD"));
             return;
         }
 
@@ -2285,7 +3194,7 @@ void processCommand(String command)
             month < 1 || month > 12 ||
             day < 1 || day > daysInMonth(year, month))
         {
-            Serial.println(F("Invalid date."));
+            DebugSerial.println(F("Invalid date."));
             return;
         }
 
@@ -2302,28 +3211,28 @@ void processCommand(String command)
     {
         clockState.running = true;
         clockState.lastTick = millis();
-        Serial.println(F("Clock running."));
+        DebugSerial.println(F("Clock running."));
         return;
     }
 
     if (command == "clock stop")
     {
         clockState.running = false;
-        Serial.println(F("Clock stopped."));
+        DebugSerial.println(F("Clock stopped."));
         return;
     }
 
     if (command == "clock 24h")
     {
         units.clock12h = false;
-        Serial.println(F("Clock format test = 24 h"));
+        DebugSerial.println(F("Clock format test = 24 h"));
         return;
     }
 
     if (command == "clock 12h")
     {
         units.clock12h = true;
-        Serial.println(F("Clock format test = 12 h"));
+        DebugSerial.println(F("Clock format test = 12 h"));
         return;
     }
 
@@ -2337,7 +3246,7 @@ void processCommand(String command)
         units.distanceMiles = false;
         units.mfaSpeedMph = false;
         units.temperatureF = false;
-        Serial.println(F("Units = metric bench preset"));
+        DebugSerial.println(F("Units = metric bench preset"));
         return;
     }
 
@@ -2346,21 +3255,21 @@ void processCommand(String command)
         units.distanceMiles = true;
         units.mfaSpeedMph = true;
         units.temperatureF = true;
-        Serial.println(F("Units = imperial bench preset"));
+        DebugSerial.println(F("Units = imperial bench preset"));
         return;
     }
 
     if (command == "temp c")
     {
         units.temperatureF = false;
-        Serial.println(F("Temperature unit = Celsius"));
+        DebugSerial.println(F("Temperature unit = Celsius"));
         return;
     }
 
     if (command == "temp f")
     {
         units.temperatureF = true;
-        Serial.println(F("Temperature unit = Fahrenheit"));
+        DebugSerial.println(F("Temperature unit = Fahrenheit"));
         return;
     }
 
@@ -2370,13 +3279,13 @@ void processCommand(String command)
 
         if (value < 0 || value > 3)
         {
-            Serial.println(F("Usage: dateformat <0-3>"));
+            DebugSerial.println(F("Usage: dateformat <0-3>"));
             return;
         }
 
         units.dateFormat = (byte)value;
-        Serial.print(F("KBI_Einheit_Datum raw = "));
-        Serial.println(units.dateFormat);
+        DebugSerial.print(F("KBI_Einheit_Datum raw = "));
+        DebugSerial.println(units.dateFormat);
         return;
     }
 
@@ -2388,8 +3297,8 @@ void processCommand(String command)
         if (value > 255) value = 255;
 
         units.language = (byte)value;
-        Serial.print(F("KBI_Einheit_Sprache raw = "));
-        Serial.println(units.language);
+        DebugSerial.print(F("KBI_Einheit_Sprache raw = "));
+        DebugSerial.println(units.language);
         return;
     }
 
@@ -2401,9 +3310,9 @@ void processCommand(String command)
         if (value > 325.0) value = 325.0;
 
         benchData.speedKph = value;
-        Serial.print(F("Vehicle speed = "));
-        Serial.print(benchData.speedKph, 1);
-        Serial.println(F(" km/h"));
+        DebugSerial.print(F("Vehicle speed = "));
+        DebugSerial.print(benchData.speedKph, 1);
+        DebugSerial.println(F(" km/h"));
         return;
     }
 
@@ -2415,9 +3324,9 @@ void processCommand(String command)
         if (value > 75.0) value = 75.0;
 
         benchData.outsideTemperatureC = value;
-        Serial.print(F("Outside temperature = "));
-        Serial.print(benchData.outsideTemperatureC, 1);
-        Serial.println(F(" C"));
+        DebugSerial.print(F("Outside temperature = "));
+        DebugSerial.print(benchData.outsideTemperatureC, 1);
+        DebugSerial.println(F(" C"));
         return;
     }
 
@@ -2429,9 +3338,9 @@ void processCommand(String command)
         if (value > 125) value = 125;
 
         benchData.fuelLiters = (byte)value;
-        Serial.print(F("Fuel content = "));
-        Serial.print(benchData.fuelLiters);
-        Serial.println(F(" L"));
+        DebugSerial.print(F("Fuel content = "));
+        DebugSerial.print(benchData.fuelLiters);
+        DebugSerial.println(F(" L"));
         return;
     }
 
@@ -2441,62 +3350,13 @@ void processCommand(String command)
 
         if (!parseOnOff(command.substring(8), value))
         {
-            Serial.println(F("Usage: reverse on/off"));
+            DebugSerial.println(F("Usage: reverse on/off"));
             return;
         }
 
         benchData.reverse = value;
-        parkhilfe.enabled = value;
-        parkhilfe.triggerDisplay = value;
-        messages[MESSAGE_COUNT - 1].enabled = value;
-        Serial.print(F("Reverse = "));
-        Serial.println(value ? F("ON") : F("OFF"));
-        return;
-    }
-
-    if (command == "park on")
-    {
-        parkhilfe.enabled = true;
-        parkhilfe.triggerDisplay = true;
-        messages[MESSAGE_COUNT - 1].enabled = true;
-        messages[MESSAGE_COUNT - 1].lastSend = 0;
-        Serial.println(F("Parkhilfe_01 0x497 = ON"));
-        return;
-    }
-
-    if (command == "park off")
-    {
-        parkhilfe.enabled = false;
-        parkhilfe.triggerDisplay = false;
-        messages[MESSAGE_COUNT - 1].enabled = false;
-        Serial.println(F("Parkhilfe_01 0x497 = OFF"));
-        return;
-    }
-
-    if (command.startsWith("park system "))
-    {
-        int value = command.substring(12).toInt();
-        if (value < 0 || value > 7) { Serial.println(F("Usage: park system <0-7>")); return; }
-        parkhilfe.systemState = (byte)value;
-        Serial.print(F("PH_Systemzustand = ")); Serial.println(parkhilfe.systemState);
-        return;
-    }
-
-    if (command.startsWith("park display "))
-    {
-        int value = command.substring(13).toInt();
-        if (value < 0 || value > 3) { Serial.println(F("Usage: park display <0-3>")); return; }
-        parkhilfe.displayRequest = (byte)value;
-        Serial.print(F("PH_Display_Kundenwunsch = ")); Serial.println(parkhilfe.displayRequest);
-        return;
-    }
-
-    if (command.startsWith("park trigger "))
-    {
-        bool value;
-        if (!parseOnOff(command.substring(13), value)) { Serial.println(F("Usage: park trigger on/off")); return; }
-        parkhilfe.triggerDisplay = value;
-        Serial.print(F("PH_Trigger_Bildaufschaltung = ")); Serial.println(value ? F("ON") : F("OFF"));
+        DebugSerial.print(F("Reverse = "));
+        DebugSerial.println(value ? F("ON") : F("OFF"));
         return;
     }
 
@@ -2506,13 +3366,14 @@ void processCommand(String command)
 
         if (!parseOnOff(command.substring(10), value))
         {
-            Serial.println(F("Usage: handbrake on/off"));
+            DebugSerial.println(F("Usage: handbrake on/off"));
             return;
         }
 
         benchData.parkingBrake = value;
-        Serial.print(F("Handbrake = "));
-        Serial.println(value ? F("ON") : F("OFF"));
+        DebugSerial.print(F("[VEHICLE] Handbrake = "));
+        DebugSerial.println(value ? F("ON") : F("OFF"));
+        armVehicleStatusProbe(value ? F("Handbrake ON") : F("Handbrake OFF"));
         return;
     }
 
@@ -2593,7 +3454,7 @@ void processCommand(String command)
         mfsw.releasePending = false;
         mfsw.buttonCode = 0x00;
         sendMfswIdle();
-        Serial.println(F("MFSW idle frame sent: 00 00 00 40"));
+        DebugSerial.println(F("MFSW idle frame sent: 00 00 00 40"));
         return;
     }
 
@@ -2603,7 +3464,7 @@ void processCommand(String command)
         mfsw.releasePending = false;
         mfsw.buttonCode = 0x00;
         sendMfswRelease();
-        Serial.println(F("MFSW release frame sent: 00 00 01 40"));
+        DebugSerial.println(F("MFSW release frame sent: 00 00 01 40"));
         return;
     }
 
@@ -2615,21 +3476,21 @@ void processCommand(String command)
     if (command == "feedback on")
     {
         volumeFeedbackEnabled = true;
-        Serial.println(F("Volume feedback = ON"));
+        DebugSerial.println(F("Volume feedback = ON"));
         return;
     }
 
     if (command == "feedback off")
     {
         volumeFeedbackEnabled = false;
-        Serial.println(F("Volume feedback = OFF"));
+        DebugSerial.println(F("Volume feedback = OFF"));
         return;
     }
 
     if (command == "ascii on")
     {
         asciiDecoderEnabled = true;
-        Serial.println(F("Infotainment ASCII decoder = ON"));
+        DebugSerial.println(F("Infotainment ASCII decoder = ON"));
         return;
     }
 
@@ -2637,30 +3498,30 @@ void processCommand(String command)
     {
         asciiDecoderEnabled = false;
         asciiMessageActive = false;
-        Serial.println(F("Infotainment ASCII decoder = OFF"));
+        DebugSerial.println(F("Infotainment ASCII decoder = OFF"));
         return;
     }
 
     if (command == "feedback")
     {
-        Serial.print(F("Volume feedback: "));
-        Serial.println(volumeFeedbackEnabled ? F("ON") : F("OFF"));
+        DebugSerial.print(F("Volume feedback: "));
+        DebugSerial.println(volumeFeedbackEnabled ? F("ON") : F("OFF"));
 
         if (volumeKnown)
         {
-            Serial.print(F("Last volume    : "));
-            Serial.println(lastVolume);
+            DebugSerial.print(F("Last volume    : "));
+            DebugSerial.println(lastVolume);
         }
         else
         {
-            Serial.println(F("Last volume    : unknown"));
+            DebugSerial.println(F("Last volume    : unknown"));
         }
 
-        Serial.print(F("ASCII decoder  : "));
-        Serial.println(asciiDecoderEnabled ? F("ON") : F("OFF"));
+        DebugSerial.print(F("ASCII decoder  : "));
+        DebugSerial.println(asciiDecoderEnabled ? F("ON") : F("OFF"));
 
-        Serial.print(F("Media metadata : "));
-        Serial.println(mediaMetadataEnabled ? F("ON") : F("OFF"));
+        DebugSerial.print(F("Media metadata : "));
+        DebugSerial.println(mediaMetadataEnabled ? F("ON") : F("OFF"));
         return;
     }
 
@@ -2668,7 +3529,7 @@ void processCommand(String command)
     {
         mediaMetadataEnabled = true;
         resetMediaMetadata();
-        Serial.println(F("Media metadata decoder = ON"));
+        DebugSerial.println(F("Media metadata decoder = ON"));
         return;
     }
 
@@ -2676,17 +3537,43 @@ void processCommand(String command)
     {
         mediaMetadataEnabled = false;
         resetMediaMetadata();
-        Serial.println(F("Media metadata decoder = OFF"));
+        DebugSerial.println(F("Media metadata decoder = OFF"));
         return;
     }
 
     if (command == "media")
     {
-        Serial.print(F("Media metadata decoder = "));
-        Serial.println(mediaMetadataEnabled ? F("ON") : F("OFF"));
+        DebugSerial.print(F("Media metadata decoder = "));
+        DebugSerial.println(mediaMetadataEnabled ? F("ON") : F("OFF"));
         return;
     }
 
+
+    // --------------------------------------------------------
+    // CLEAN SERIAL / DISCOVERY / VEHICLE STATUS HUNTER
+    // --------------------------------------------------------
+
+    if (command == "statuswatch on")
+    {
+        vehicleStatusProbeEnabled = true;
+        DebugSerial.println(F("[SYSTEM] Vehicle-status probe = ON"));
+        return;
+    }
+
+    if (command == "statuswatch off")
+    {
+        vehicleStatusProbeEnabled = false;
+        vehicleStatusProbeActive = false;
+        DebugSerial.println(F("[SYSTEM] Vehicle-status probe = OFF"));
+        return;
+    }
+
+    if (command == "statuswatch")
+    {
+        DebugSerial.print(F("[SYSTEM] Vehicle-status probe = "));
+        DebugSerial.println(vehicleStatusProbeEnabled ? F("ON") : F("OFF"));
+        return;
+    }
 
     // --------------------------------------------------------
     // MARK / MONITOR
@@ -2696,75 +3583,75 @@ void processCommand(String command)
     {
         markerCounter++;
 
-        Serial.println();
-        Serial.println(F("======================================"));
-        Serial.print(F("USER MARK "));
-        Serial.print(markerCounter);
-        Serial.print(F(" @ "));
-        Serial.print(millis());
-        Serial.println(F(" ms"));
-        Serial.println(F("======================================"));
-        Serial.println();
+        DebugSerial.println();
+        DebugSerial.println(F("======================================"));
+        DebugSerial.print(F("USER MARK "));
+        DebugSerial.print(markerCounter);
+        DebugSerial.print(F(" @ "));
+        DebugSerial.print(millis());
+        DebugSerial.println(F(" ms"));
+        DebugSerial.println(F("======================================"));
+        DebugSerial.println();
         return;
     }
 
     if (command == "monitor all" || command == "monitor on")
     {
         monitorMode = MONITOR_ALL;
-        Serial.println(F("CAN monitor: RX + TX"));
+        DebugSerial.println(F("CAN monitor: RX + TX"));
         return;
     }
 
     if (command == "monitor rx")
     {
         monitorMode = MONITOR_RX;
-        Serial.println(F("CAN monitor: RX only"));
+        DebugSerial.println(F("CAN monitor: RX only"));
         return;
     }
 
     if (command == "monitor tx")
     {
         monitorMode = MONITOR_TX;
-        Serial.println(F("CAN monitor: TX only"));
+        DebugSerial.println(F("CAN monitor: TX only"));
         return;
     }
 
     if (command == "monitor diag")
     {
         monitorMode = MONITOR_DIAG;
-        Serial.println(F("Diagnostic monitor: RX extended frames only."));
+        DebugSerial.println(F("Diagnostic monitor: RX extended frames only."));
         return;
     }
 
     if (command == "monitor off")
     {
         monitorMode = MONITOR_OFF;
-        Serial.println(F("CAN monitor OFF"));
+        DebugSerial.println(F("CAN monitor OFF"));
         return;
     }
 
     // Extended DBC vehicle simulation commands.
-    if (command.startsWith("oiltemp ")) { float v=command.substring(8).toFloat(); if(v<-60)v=-60;if(v>192)v=192;extData.oilTempC10=(int16_t)(v*10);Serial.println(F("Oil temperature updated"));return; }
-    if (command.startsWith("coolant ")) { float v=command.substring(8).toFloat(); if(v<-48)v=-48;if(v>141.7)v=141.7;extData.coolantTempC10=(int16_t)(v*10);Serial.println(F("Coolant temperature updated"));return; }
-    if (command.startsWith("iat ")) { float v=command.substring(4).toFloat(); if(v<-48)v=-48;if(v>141.7)v=141.7;extData.intakeTempC10=(int16_t)(v*10);Serial.println(F("Intake temperature updated"));return; }
-    if (command.startsWith("oilpressure ")) { float v=command.substring(12).toFloat(); if(v<0)v=0;if(v>10)v=10;extData.oilPressureCentiBar=(uint16_t)(v*100);Serial.println(F("Oil pressure updated"));return; }
-    if (command.startsWith("boost ")) { float v=command.substring(6).toFloat(); if(v<0)v=0;if(v>5.1)v=5.1;extData.boostCentiBar=(uint16_t)(v*100);Serial.println(F("Boost pressure updated"));return; }
-    if (command.startsWith("throttle ")) { int v=command.substring(9).toInt();if(v<0)v=0;if(v>100)v=100;extData.throttlePercent=(byte)v;Serial.println(F("Throttle updated"));return; }
-    if (command.startsWith("oillevel ")) { int v=command.substring(9).toInt();if(v<0)v=0;if(v>100)v=100;extData.oilLevelPercent=(byte)v;Serial.println(F("Oil level updated"));return; }
+    if (command.startsWith("oiltemp ")) { float v=command.substring(8).toFloat(); if(v<-60)v=-60;if(v>192)v=192;extData.oilTempC10=(int16_t)(v*10);DebugSerial.println(F("Oil temperature updated"));return; }
+    if (command.startsWith("coolant ")) { float v=command.substring(8).toFloat(); if(v<-48)v=-48;if(v>141.7)v=141.7;extData.coolantTempC10=(int16_t)(v*10);DebugSerial.println(F("Coolant temperature updated"));return; }
+    if (command.startsWith("iat ")) { float v=command.substring(4).toFloat(); if(v<-48)v=-48;if(v>141.7)v=141.7;extData.intakeTempC10=(int16_t)(v*10);DebugSerial.println(F("Intake temperature updated"));return; }
+    if (command.startsWith("oilpressure ")) { float v=command.substring(12).toFloat(); if(v<0)v=0;if(v>10)v=10;extData.oilPressureCentiBar=(uint16_t)(v*100);DebugSerial.println(F("Oil pressure updated"));return; }
+    if (command.startsWith("boost ")) { float v=command.substring(6).toFloat(); if(v<0)v=0;if(v>5.1)v=5.1;extData.boostCentiBar=(uint16_t)(v*100);DebugSerial.println(F("Boost pressure updated"));return; }
+    if (command.startsWith("throttle ")) { int v=command.substring(9).toInt();if(v<0)v=0;if(v>100)v=100;extData.throttlePercent=(byte)v;DebugSerial.println(F("Throttle updated"));return; }
+    if (command.startsWith("oillevel ")) { int v=command.substring(9).toInt();if(v<0)v=0;if(v>100)v=100;extData.oilLevelPercent=(byte)v;DebugSerial.println(F("Oil level updated"));return; }
 
-    if (command.startsWith("clutch ")) { bool v;if(!parseOnOff(command.substring(7),v)){Serial.println(F("Usage: clutch on/off"));return;}extData.clutch=v;Serial.println(v?F("Clutch ON"):F("Clutch OFF"));return; }
-    if (command.startsWith("kickdown ")) { bool v;if(!parseOnOff(command.substring(9),v)){Serial.println(F("Usage: kickdown on/off"));return;}extData.kickdown=v;Serial.println(v?F("Kickdown ON"):F("Kickdown OFF"));return; }
-    if (command.startsWith("mil ")) { bool v;if(!parseOnOff(command.substring(4),v)){Serial.println(F("Usage: mil on/off"));return;}extData.mil=v;Serial.println(v?F("MIL ON"):F("MIL OFF"));return; }
-    if (command.startsWith("enginewarn ")) { bool v;if(!parseOnOff(command.substring(11),v)){Serial.println(F("Usage: enginewarn on/off"));return;}extData.engineWarning=v;Serial.println(v?F("Engine warning ON"):F("Engine warning OFF"));return; }
-    if (command.startsWith("oilwarn ")) { bool v;if(!parseOnOff(command.substring(8),v)){Serial.println(F("Usage: oilwarn on/off"));return;}extData.oilWarning=v;Serial.println(v?F("Oil warning ON"):F("Oil warning OFF"));return; }
-    if (command.startsWith("abslamp ")) { bool v;if(!parseOnOff(command.substring(8),v)){Serial.println(F("Usage: abslamp on/off"));return;}extData.absLamp=v;Serial.println(v?F("ABS lamp ON"):F("ABS lamp OFF"));return; }
-    if (command.startsWith("esplamp ")) { bool v;if(!parseOnOff(command.substring(8),v)){Serial.println(F("Usage: esplamp on/off"));return;}extData.espLamp=v;Serial.println(v?F("ESP lamp ON"):F("ESP lamp OFF"));return; }
-    if (command.startsWith("airbaglamp ")) { bool v;if(!parseOnOff(command.substring(11),v)){Serial.println(F("Usage: airbaglamp on/off"));return;}extData.airbagLamp=v;Serial.println(v?F("Airbag lamp ON"):F("Airbag lamp OFF"));return; }
-    if (command.startsWith("steeringlamp ")) { bool v;if(!parseOnOff(command.substring(13),v)){Serial.println(F("Usage: steeringlamp on/off"));return;}extData.steeringLamp=v;Serial.println(v?F("Steering lamp ON"):F("Steering lamp OFF"));return; }
+    if (command.startsWith("clutch ")) { bool v;if(!parseOnOff(command.substring(7),v)){DebugSerial.println(F("Usage: clutch on/off"));return;}extData.clutch=v;DebugSerial.println(v?F("Clutch ON"):F("Clutch OFF"));return; }
+    if (command.startsWith("kickdown ")) { bool v;if(!parseOnOff(command.substring(9),v)){DebugSerial.println(F("Usage: kickdown on/off"));return;}extData.kickdown=v;DebugSerial.println(v?F("Kickdown ON"):F("Kickdown OFF"));return; }
+    if (command.startsWith("mil ")) { bool v;if(!parseOnOff(command.substring(4),v)){DebugSerial.println(F("Usage: mil on/off"));return;}extData.mil=v;DebugSerial.println(v?F("[VEHICLE] MIL = ON"):F("[VEHICLE] MIL = OFF"));armVehicleStatusProbe(v?F("MIL ON"):F("MIL OFF"));return; }
+    if (command.startsWith("enginewarn ")) { bool v;if(!parseOnOff(command.substring(11),v)){DebugSerial.println(F("Usage: enginewarn on/off"));return;}extData.engineWarning=v;DebugSerial.println(v?F("[VEHICLE] Engine warning = ON"):F("[VEHICLE] Engine warning = OFF"));armVehicleStatusProbe(v?F("Engine warning ON"):F("Engine warning OFF"));return; }
+    if (command.startsWith("oilwarn ")) { bool v;if(!parseOnOff(command.substring(8),v)){DebugSerial.println(F("Usage: oilwarn on/off"));return;}extData.oilWarning=v;DebugSerial.println(v?F("[VEHICLE] Oil warning = ON"):F("[VEHICLE] Oil warning = OFF"));armVehicleStatusProbe(v?F("Oil warning ON"):F("Oil warning OFF"));return; }
+    if (command.startsWith("abslamp ")) { bool v;if(!parseOnOff(command.substring(8),v)){DebugSerial.println(F("Usage: abslamp on/off"));return;}extData.absLamp=v;DebugSerial.println(v?F("[VEHICLE] ABS warning = ON"):F("[VEHICLE] ABS warning = OFF"));armVehicleStatusProbe(v?F("ABS warning ON"):F("ABS warning OFF"));return; }
+    if (command.startsWith("esplamp ")) { bool v;if(!parseOnOff(command.substring(8),v)){DebugSerial.println(F("Usage: esplamp on/off"));return;}extData.espLamp=v;DebugSerial.println(v?F("[VEHICLE] ESP warning = ON"):F("[VEHICLE] ESP warning = OFF"));armVehicleStatusProbe(v?F("ESP warning ON"):F("ESP warning OFF"));return; }
+    if (command.startsWith("airbaglamp ")) { bool v;if(!parseOnOff(command.substring(11),v)){DebugSerial.println(F("Usage: airbaglamp on/off"));return;}extData.airbagLamp=v;DebugSerial.println(v?F("[VEHICLE] Airbag warning = ON"):F("[VEHICLE] Airbag warning = OFF"));armVehicleStatusProbe(v?F("Airbag warning ON"):F("Airbag warning OFF"));return; }
+    if (command.startsWith("steeringlamp ")) { bool v;if(!parseOnOff(command.substring(13),v)){DebugSerial.println(F("Usage: steeringlamp on/off"));return;}extData.steeringLamp=v;DebugSerial.println(v?F("[VEHICLE] Steering warning = ON"):F("[VEHICLE] Steering warning = OFF"));armVehicleStatusProbe(v?F("Steering warning ON"):F("Steering warning OFF"));return; }
 
-    Serial.print(F("Unknown command: "));
-    Serial.println(command);
-    Serial.println(F("Type 'help' for available commands."));
+    DebugSerial.print(F("Unknown command: "));
+    DebugSerial.println(command);
+    DebugSerial.println(F("Type 'help' for available commands."));
 }
 
 
@@ -2794,30 +3681,30 @@ bool parseOnOff(String value, bool &result)
 
 void printState()
 {
-    Serial.println();
-    Serial.println(F("Vehicle state"));
-    Serial.println(F("-------------"));
+    DebugSerial.println();
+    DebugSerial.println(F("Vehicle state"));
+    DebugSerial.println(F("-------------"));
 
-    Serial.print(F("Terminal S  : "));
-    Serial.println(vehicle.terminalS ? F("ON") : F("OFF"));
+    DebugSerial.print(F("Terminal S  : "));
+    DebugSerial.println(vehicle.terminalS ? F("ON") : F("OFF"));
 
-    Serial.print(F("Terminal 15 : "));
-    Serial.println(vehicle.terminal15 ? F("ON") : F("OFF"));
+    DebugSerial.print(F("Terminal 15 : "));
+    DebugSerial.println(vehicle.terminal15 ? F("ON") : F("OFF"));
 
-    Serial.print(F("Terminal X  : "));
-    Serial.println(vehicle.terminalX ? F("ON") : F("OFF"));
+    DebugSerial.print(F("Terminal X  : "));
+    DebugSerial.println(vehicle.terminalX ? F("ON") : F("OFF"));
 
-    Serial.print(F("Terminal 50 : "));
-    Serial.println(vehicle.terminal50 ? F("ON") : F("OFF"));
+    DebugSerial.print(F("Terminal 50 : "));
+    DebugSerial.println(vehicle.terminal50 ? F("ON") : F("OFF"));
 
-    Serial.print(F("Terminal 75 : "));
-    Serial.println(vehicle.terminal75 ? F("ON") : F("OFF"));
+    DebugSerial.print(F("Terminal 75 : "));
+    DebugSerial.println(vehicle.terminal75 ? F("ON") : F("OFF"));
 
-    Serial.print(F("Engine      : "));
-    Serial.println(vehicle.engineRunning ? F("RUNNING") : F("STOPPED"));
+    DebugSerial.print(F("Engine      : "));
+    DebugSerial.println(vehicle.engineRunning ? F("RUNNING") : F("STOPPED"));
 
-    Serial.print(F("RPM         : "));
-    Serial.println(vehicle.engineRpm);
+    DebugSerial.print(F("RPM         : "));
+    DebugSerial.println(vehicle.engineRpm);
 
     byte flags = 0;
 
@@ -2826,14 +3713,14 @@ void printState()
     if (vehicle.terminalX)  flags |= 0x04;
     if (vehicle.terminal50) flags |= 0x08;
 
-    Serial.print(F("3C0 flags   : 0x"));
+    DebugSerial.print(F("3C0 flags   : 0x"));
 
     if (flags < 0x10)
     {
-        Serial.print('0');
+        DebugSerial.print('0');
     }
 
-    Serial.println(flags, HEX);
+    DebugSerial.println(flags, HEX);
 
     printLighting();
     printClock();
@@ -2842,198 +3729,119 @@ void printState()
 
 void printLighting()
 {
-    Serial.println();
-    Serial.println(F("Lighting"));
-    Serial.println(F("--------"));
+    DebugSerial.println();
+    DebugSerial.println(F("Lighting"));
+    DebugSerial.println(F("--------"));
 
-    Serial.print(F("Lights enabled: "));
-    Serial.println(lighting.lightsEnabled ? F("YES") : F("NO"));
+    DebugSerial.print(F("Lights enabled: "));
+    DebugSerial.println(lighting.lightsEnabled ? F("YES") : F("NO"));
 
-    Serial.print(F("Dimming 58xd : "));
-    Serial.println(lighting.dimming58xd);
+    DebugSerial.print(F("Dimming 58xd : "));
+    DebugSerial.println(lighting.dimming58xd);
 
-    Serial.print(F("Dimming 58xs : "));
-    Serial.println(lighting.dimming58xs);
+    DebugSerial.print(F("Dimming 58xs : "));
+    DebugSerial.println(lighting.dimming58xs);
 
-    Serial.print(F("Dimming 58xt : "));
-    Serial.println(lighting.dimming58xt);
+    DebugSerial.print(F("Dimming 58xt : "));
+    DebugSerial.println(lighting.dimming58xt);
 
-    Serial.print(F("Night design : "));
-    Serial.println(lighting.nightDesign ? F("ON") : F("OFF"));
+    DebugSerial.print(F("Night design : "));
+    DebugSerial.println(lighting.nightDesign ? F("ON") : F("OFF"));
 
-    Serial.print(F("Photo sensor : "));
-    Serial.println(lighting.photoSensor);
+    DebugSerial.print(F("Photo sensor : "));
+    DebugSerial.println(lighting.photoSensor);
 }
 
 void printClock()
 {
-    Serial.println();
-    Serial.println(F("Clock"));
-    Serial.println(F("-----"));
+    DebugSerial.println();
+    DebugSerial.println(F("Clock"));
+    DebugSerial.println(F("-----"));
 
-    if (clockState.day < 10) Serial.print('0');
-    Serial.print(clockState.day);
-    Serial.print('-');
+    if (clockState.day < 10) DebugSerial.print('0');
+    DebugSerial.print(clockState.day);
+    DebugSerial.print('-');
 
-    if (clockState.month < 10) Serial.print('0');
-    Serial.print(clockState.month);
-    Serial.print('-');
+    if (clockState.month < 10) DebugSerial.print('0');
+    DebugSerial.print(clockState.month);
+    DebugSerial.print('-');
 
-    Serial.println(clockState.year);
+    DebugSerial.println(clockState.year);
 
-    if (clockState.hour < 10) Serial.print('0');
-    Serial.print(clockState.hour);
-    Serial.print(':');
+    if (clockState.hour < 10) DebugSerial.print('0');
+    DebugSerial.print(clockState.hour);
+    DebugSerial.print(':');
 
-    if (clockState.minute < 10) Serial.print('0');
-    Serial.print(clockState.minute);
-    Serial.print(':');
+    if (clockState.minute < 10) DebugSerial.print('0');
+    DebugSerial.print(clockState.minute);
+    DebugSerial.print(':');
 
-    if (clockState.second < 10) Serial.print('0');
-    Serial.println(clockState.second);
+    if (clockState.second < 10) DebugSerial.print('0');
+    DebugSerial.println(clockState.second);
 
-    Serial.print(F("Running      : "));
-    Serial.println(clockState.running ? F("YES") : F("NO"));
+    DebugSerial.print(F("Running      : "));
+    DebugSerial.println(clockState.running ? F("YES") : F("NO"));
 }
 
 void printMfsw()
 {
-    Serial.println();
-    Serial.println(F("MFSW 0x5BF - Golf Mk7 capture format"));
-    Serial.println(F("------------------------------------"));
-    Serial.println(F("DLC          : 4"));
-    Serial.println(F("Idle         : 00 00 00 40"));
-    Serial.println(F("Release      : 00 00 01 40"));
+    DebugSerial.println();
+    DebugSerial.println(F("MFSW 0x5BF - Golf Mk7 capture format"));
+    DebugSerial.println(F("------------------------------------"));
+    DebugSerial.println(F("DLC          : 4"));
+    DebugSerial.println(F("Idle         : 00 00 00 40"));
+    DebugSerial.println(F("Release      : 00 00 01 40"));
 
-    Serial.print(F("Active       : "));
-    Serial.println(mfsw.active ? F("YES") : F("NO"));
+    DebugSerial.print(F("Active       : "));
+    DebugSerial.println(mfsw.active ? F("YES") : F("NO"));
 
-    Serial.print(F("Button code  : 0x"));
-    if (mfsw.buttonCode < 0x10) Serial.print('0');
-    Serial.println(mfsw.buttonCode, HEX);
+    DebugSerial.print(F("Button code  : 0x"));
+    if (mfsw.buttonCode < 0x10) DebugSerial.print('0');
+    DebugSerial.println(mfsw.buttonCode, HEX);
 }
 
 void printMessages()
 {
-    Serial.println();
-    Serial.println(F("CAN messages"));
-    Serial.println(F("------------"));
+    DebugSerial.println();
+    DebugSerial.println(F("CAN messages"));
+    DebugSerial.println(F("------------"));
 
     for (byte i = 0; i < MESSAGE_COUNT; i++)
     {
         CanMessage &message = messages[i];
 
-        Serial.print(F("["));
-        Serial.print(i);
-        Serial.print(F("] "));
-        Serial.print(message.name);
-        Serial.print(F("  0x"));
-        Serial.print(message.id, HEX);
-        Serial.print(F("  "));
-        Serial.print(message.interval);
-        Serial.print(F(" ms  "));
-        Serial.println(message.enabled ? F("ENABLED") : F("DISABLED"));
+        DebugSerial.print(F("["));
+        DebugSerial.print(i);
+        DebugSerial.print(F("] "));
+        DebugSerial.print(message.name);
+        DebugSerial.print(F("  0x"));
+        DebugSerial.print(message.id, HEX);
+        DebugSerial.print(F("  "));
+        DebugSerial.print(message.interval);
+        DebugSerial.print(F(" ms  "));
+        DebugSerial.println(message.enabled ? F("ENABLED") : F("DISABLED"));
     }
 
-    Serial.println(F("MFSW generator: 0x5BF, DLC 4, Golf Mk7 capture format"));
-    Serial.println();
+    DebugSerial.println(F("MFSW generator: 0x5BF, DLC 4, Golf Mk7 capture format"));
+    DebugSerial.println();
 }
 
 void printHelp()
 {
-    Serial.println();
-    Serial.println(F("Commands"));
-    Serial.println(F("--------"));
-    Serial.println(F("on"));
-    Serial.println(F("off"));
-    Serial.println(F("ignition on"));
-    Serial.println(F("ignition off"));
-    Serial.println(F("engine on"));
-    Serial.println(F("engine off"));
-    Serial.println(F("starter on"));
-    Serial.println(F("starter off"));
-    Serial.println(F("rpm <value>"));
-    Serial.println(F("startstop <0-3>"));
-    Serial.println();
-
-    Serial.println(F("terminal s on/off"));
-    Serial.println(F("terminal 15 on/off"));
-    Serial.println(F("terminal x on/off"));
-    Serial.println(F("terminal 50 on/off"));
-    Serial.println(F("terminal 75 on/off"));
-    Serial.println();
-
-    Serial.println(F("lights on"));
-    Serial.println(F("lights off"));
-    Serial.println(F("dimming <0-100>"));
-    Serial.println(F("night on/off"));
-    Serial.println(F("photosensor <0-65535>"));
-    Serial.println(F("lighting"));
-    Serial.println();
-
-    Serial.println(F("time HH:MM[:SS]"));
-    Serial.println(F("date YYYY-MM-DD"));
-    Serial.println(F("clock"));
-    Serial.println(F("clock run"));
-    Serial.println(F("clock stop"));
-    Serial.println(F("clock 24h"));
-    Serial.println(F("clock 12h"));
-    Serial.println();
-    Serial.println(F("units metric"));
-    Serial.println(F("units imperial"));
-    Serial.println(F("temp c"));
-    Serial.println(F("temp f"));
-    Serial.println(F("dateformat <0-3>"));
-    Serial.println(F("language <0-255>"));
-    Serial.println(F("speed <0-325>"));
-    Serial.println(F("outside <-50..75>"));
-    Serial.println(F("fuel <0-125>"));
-    Serial.println(F("reverse on/off"));
-    Serial.println(F("handbrake on/off"));
-    Serial.println(F("park on/off"));
-    Serial.println(F("park system <0-7>"));
-    Serial.println(F("park display <0-3>"));
-    Serial.println(F("park trigger on/off"));
-    Serial.println();
-
-    Serial.println(F("mfsw volup"));
-    Serial.println(F("mfsw voldown"));
-    Serial.println(F("mfsw next"));
-    Serial.println(F("mfsw previous"));
-    Serial.println(F("mfsw phone"));
-    Serial.println(F("mfsw voice"));
-    Serial.println(F("mfsw left"));
-    Serial.println(F("mfsw right"));
-    Serial.println(F("mfsw up"));
-    Serial.println(F("mfsw down"));
-    Serial.println(F("mfsw ok"));
-    Serial.println(F("mfsw idle"));
-    Serial.println(F("mfsw release"));
-    Serial.println(F("mfsw"));
-    Serial.println();
-
-    Serial.println(F("state"));
-    Serial.println(F("messages"));
-    Serial.println(F("mark"));
-    Serial.println();
-
-    Serial.println(F("feedback"));
-    Serial.println(F("feedback on"));
-    Serial.println(F("feedback off"));
-    Serial.println(F("ascii on"));
-    Serial.println(F("ascii off"));
-    Serial.println(F("media"));
-    Serial.println(F("media on"));
-    Serial.println(F("media off"));
-    Serial.println();
-
-    Serial.println(F("monitor all"));
-    Serial.println(F("monitor rx"));
-    Serial.println(F("monitor tx"));
-    Serial.println(F("monitor diag"));
-    Serial.println(F("monitor off"));
-    Serial.println();
-
-    Serial.println(F("help"));
-    Serial.println();
+    DebugSerial.println();
+    DebugSerial.println(F("MQB Emulator ESP32-S3 v1.1.1 TripData Lab"));
+    DebugSerial.println(F("on/off | engine on/off | rpm <n>"));
+    DebugSerial.println(F("lights on/off | dimming <0-100>"));
+    DebugSerial.println(F("speed/outside/fuel | handbrake/reverse on/off"));
+    DebugSerial.println(F("mfsw volup/voldown/next/previous"));
+    DebugSerial.println(F("mfsw phone/voice/left/right/up/down/ok"));
+    DebugSerial.println(F("feedback | ascii on/off | media on/off"));
+    DebugSerial.println(F("abslamp/esplamp/mil/oilwarn on/off"));
+    DebugSerial.println(F("enginewarn/airbaglamp/steeringlamp on/off"));
+    DebugSerial.println(F("statuswatch on/off | bcprov on/off"));
+    DebugSerial.println(F("bctrip on/off | bctrip <km>  (Function 0x39 test)"));
+    DebugSerial.println(F("monitor all/rx/tx/diag/off"));
+    DebugSerial.println(F("canstats"));
+    DebugSerial.println(F("state | messages | mark | help"));
+    DebugSerial.println();
 }

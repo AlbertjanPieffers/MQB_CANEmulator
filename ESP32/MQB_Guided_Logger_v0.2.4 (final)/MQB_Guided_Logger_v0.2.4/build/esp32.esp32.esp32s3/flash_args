@@ -1,0 +1,5 @@
+--flash-mode dio --flash-freq 80m --flash-size 16MB  
+0x0 MQB_Guided_Logger_v0.2.4.ino.bootloader.bin  
+0x8000 MQB_Guided_Logger_v0.2.4.ino.partitions.bin  
+0xe000 boot_app0.bin  
+0x10000 MQB_Guided_Logger_v0.2.4.ino.bin 
